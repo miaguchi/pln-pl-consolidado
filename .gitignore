@@ -1,0 +1,34 @@
+# data
+*.xlsx
+*.csv
+
+# outputs
+*.png
+*.pdf
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# env
+.env
+.venv/
+venv/
+env/
+
+# ide
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.spyproject/
+
+# os
+.DS_Store
+Thumbs.db
