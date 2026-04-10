@@ -20,7 +20,7 @@ Investigar os determinantes do sucesso legislativo de projetos de lei, combinand
 
 ## Estrutura do Pipeline
 
-O script executa **47 secoes** organizadas em blocos logicos:
+O script executa **58 secoes** organizadas em blocos logicos:
 
 ### Bloco 1 — Pre-processamento (secoes 1-4)
 
@@ -96,6 +96,21 @@ O script executa **47 secoes** organizadas em blocos logicos:
 | 46 | Calibration plot do modelo preditivo |
 | 47 | Coherence score do LDA (validacao k=4,5,6) |
 
+### Bloco 7 — Analises Avancadas (secoes 48-58)
+
+| Secao | Descricao |
+|---|---|
+| 48 | PCA / Analise Fatorial — perfil tematico dos parlamentares |
+| 49 | ARIMA — series temporais (producao e sucesso anual) |
+| 50 | Rede Neural MLP — deep learning |
+| 51 | Simulacao de Monte Carlo — incerteza das previsoes |
+| 52 | Social Network Analysis — comunidades e integracao |
+| 53 | Cluster Hierarquico + Dendrograma |
+| 54 | Arvore de Decisao — visualizacao e interpretacao |
+| 55 | Regressao Linear OLS — produtividade e sucesso |
+| 57 | MDS — Escalonamento Multidimensional |
+| 58 | AHP — Analytic Hierarchy Process |
+
 ## Saidas
 
 ### Excel
@@ -156,9 +171,9 @@ python pln_pl_consolidado.py
 
 ## Metodologia
 
-- **LDA**: 5 topicos, `max_iter=30`, `random_state=42`
+- **LDA**: 5 topicos, `max_iter=50`, `random_state=42`
 - **Logit inferencial**: erros clusterizados por autor (Huber-White)
-- **Firth (rare events)**: regularizacao L1 como proxy para evento raro (~1.3% de aprovacao)
+- **Firth (rare events)**: Firth genuino via `firthmodels` (Jeffreys prior); fallback para L1 regularizado caso indisponivel (~1.3% de aprovacao)
 - **ML**: backtesting temporal com treino em legislaturas anteriores e teste na seguinte
 - **Validacao**: probit, cross-validation 5-fold, calibration plot, coherence score
 

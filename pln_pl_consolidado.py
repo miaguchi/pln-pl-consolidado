@@ -6,7 +6,8 @@ com análise de corporação, regressões inferenciais,
 modelos preditivos, previsões futuras e backtesting temporal.
 
 Autor: Thiago
-Data: 2026-03-18
+Data original: 2026-03-18
+Última atualização: 2026-04-10
 Versão v27 — v26 + correções pontuais para fechamento do artigo:
 (1) Helper Firth: filtra apenas colunas referenciadas na fórmula (antes pegava 'Autor' e quebrava);
 (2) §22B-EXT-2 e §43: centraliza ano_c² após padronização (resolve p=nan e pseudo-R² negativo);
