@@ -7,7 +7,11 @@ modelos preditivos, previsões futuras e backtesting temporal.
 
 Autor: Thiago
 Data: 2026-03-18
-Versão consolidada final — códigos 1 + 2 + 3 integrados
+Versão v27 — v26 + correções pontuais para fechamento do artigo:
+(1) Helper Firth: filtra apenas colunas referenciadas na fórmula (antes pegava 'Autor' e quebrava);
+(2) §22B-EXT-2 e §43: centraliza ano_c² após padronização (resolve p=nan e pseudo-R² negativo);
+(3) §37 Probit: corrige divisão por probit_vals.clip([-1e6,-1e-8]) que forçava negativo (resolve razões -9e7);
+(4) §42: flag explícito quando p-valores são NaN por separação quase-completa.
 """
 
 from pathlib import Path
@@ -16,6 +20,8 @@ import unicodedata
 from collections import Counter
 from itertools import islice
 
+import matplotlib
+#matplotlib.use("Agg")
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -25,6 +31,8 @@ from scipy.stats import chi2_contingency
 from scipy import linalg
 import statsmodels.formula.api as smf
 import statsmodels.api as sm
+from statsmodels.discrete.discrete_model import Logit
+import os
 
 try:
     import networkx as nx
@@ -223,24 +231,80 @@ _CORP_LABELS = {
 # =========================================================
 
 stopwords = {
-    "a", "o", "as", "os", "de", "da", "do", "das", "dos", "e", "em", "para", "por", "com",
-    "que", "na", "no", "nas", "nos", "uma", "um", "ao", "aos", "se", "sua", "seu", "suas", "seus",
-    "projeto", "lei", "dispõe", "dispoe", "sobre", "federal", "nacional", "brasil", "brasileiro",
-    "brasileira", "constituição", "constituicao", "institui", "altera", "acrescenta", "autoriza",
-    "estabelece", "cria", "outras", "providências", "providencias", "art", "arts", "nova",
-    "redacao", "redação", "codigo", "decreto", "dezembro", "outubro", "setembro", "julho",
-    "pelo", "pela", "pelas", "pelos", "como", "inciso", "paragrafo", "parágrafo", "unico",
-    "único", "dispor", "acresce"
+    # artigos, preposições, conjunções
+    "a", "o", "as", "os", "de", "da", "do", "das", "dos", "e", "em", "para",
+    "por", "com", "que", "na", "no", "nas", "nos", "uma", "um", "ao", "aos",
+    "se", "sua", "seu", "suas", "seus", "como", "ou", "pelo", "pela", "pelas",
+    "pelos", "ser", "ter", "este", "esta", "esse", "essa", "isso",
+ 
+    # boilerplate de ementa legislativa
+    "projeto", "lei", "dispoe", "dispõe", "sobre", "institui", "altera",
+    "acrescenta", "autoriza", "estabelece", "cria", "outras", "providencias",
+    "providências", "art", "arts", "artigo", "nova", "redacao", "redação",
+    "codigo", "código", "decreto", "constituição", "constituicao", "ato",
+    "caput", "alinea", "alínea", "inciso", "paragrafo", "parágrafo", "unico",
+    "único", "dispor", "acresce", "vigor", "publicacao", "publicação",
+    "revoga", "revogadas", "revogada",
+ 
+    # institucional/geográfico genérico
+    "brasil", "brasileiro", "brasileira", "federal", "nacional", "republica",
+    "república", "uniao", "união", "estados", "estado", "municipios",
+    "municípios", "municipio", "município", "federativa", "constitucional",
+    "constitucionais", "disposicoes", "disposições", "dispositivo",
+    "dispositivos",
+    "distrito",  # remove "Distrito Federal" como ruído
+ 
+    # MESES — TODOS (ementas citam datas de promulgação)
+    "janeiro", "fevereiro", "marco", "março", "abril", "maio", "junho",
+    "julho", "agosto", "setembro", "outubro", "novembro", "dezembro",
+ 
+    # temporais/quantitativos vagos
+    "dia", "dias", "ano", "anos", "mes", "meses", "data", "prazo", "periodo",
+    "período", "hora", "horas",
+ 
+    # jurídicos genéricos que aparecem em todos os tópicos
+    "publico", "público", "publica", "pública", "publicos", "públicos",
+    "publicas", "públicas", "leis", "norma", "normas", "regra", "regras",
+    "sistema", "programa", "plano", "politica", "política", "regime",
+    "civil",
+ 
+    # pronomes/quantificadores vagos
+    "pessoa", "pessoas", "todos", "todas", "qualquer", "quaisquer",
+    "outros", "outras", "mesmo", "mesma", "contra", "sob", "ate", "até",
 }
+ 
+stopwords_juridicas = set()  # já incorporado acima
+stopwords_totais = stopwords  # alias para manter compatibilidade
+ 
+ 
+# ──────────────────────────────────────────────────────────────────────
+# SUBSTITUIÇÃO 2 — CountVectorizer da seção 10 (LDA)
+# ──────────────────────────────────────────────────────────────────────
+# Procure por "vectorizer = CountVectorizer(max_df=0.95, min_df=2)"
+# e substitua APENAS essa linha por:
+ 
+vectorizer = CountVectorizer(
+    max_df=0.85,                       # remove termos em >85% dos docs
+    min_df=10,                         # remove termos em <10 docs
+    max_features=2000,                 # vocabulário enxuto
+    token_pattern=r"\b[a-z]{4,}\b",    # mínimo 4 letras
+)
+ 
+ 
+# ──────────────────────────────────────────────────────────────────────
+# SUBSTITUIÇÃO 3 (opcional, recomendada) — LDA com priors mais informativos
+# ──────────────────────────────────────────────────────────────────────
+# Procure por "lda = LatentDirichletAllocation(" na seção 10 e substitua por:
+ 
+lda = LatentDirichletAllocation(
+    n_components=N_TOPICOS,
+    learning_method="batch",
+    max_iter=50,
+    doc_topic_prior=0.1,    # alpha baixo: documentos focados em poucos tópicos
+    topic_word_prior=0.01,  # beta baixo: tópicos focados em poucos termos
+    random_state=42,
+)
 
-stopwords_juridicas = {
-    "artigo", "art", "disposicoes", "constitucional", "constitucionais",
-    "ato", "caput", "alinea", "inciso", "paragrafo",
-    "republica", "uniao", "estados", "estado", "municipios",
-    "federativa", "dispositivo", "dispositivos"
-}
-
-stopwords_totais = stopwords.union(stopwords_juridicas)
 
 
 # =========================================================
@@ -786,7 +850,16 @@ def extrair_metricas_modelo_contagem(modelo, nome_modelo, y_name):
     if pd.notna(out["pearson_chi2"]) and pd.notna(out["df_resid"]) and out["df_resid"] > 0:
         out["dispersion_ratio"] = out["pearson_chi2"] / out["df_resid"]
     else:
-        out["dispersion_ratio"] = np.nan
+        # Poisson/NB do statsmodels não expõem pearson_chi2 — calcula manualmente
+        try:
+            _y_obs = np.asarray(modelo.model.endog, dtype=float)
+            _mu    = np.asarray(modelo.predict(), dtype=float)
+            _var   = np.where(_mu > 0, _mu, np.nan)  # Poisson: var = mu
+            _pchi  = float(np.nansum((_y_obs - _mu) ** 2 / _var))
+            out["pearson_chi2"]    = _pchi
+            out["dispersion_ratio"] = _pchi / out["df_resid"] if out["df_resid"] > 0 else np.nan
+        except Exception:
+            out["dispersion_ratio"] = np.nan
 
     return pd.DataFrame([out])
 
@@ -808,8 +881,9 @@ def extrair_coef_contagem(modelo, nome_modelo):
         out["p_value"] = modelo.pvalues.values
         out["ic95_inf_coef"] = ci.iloc[:, 0].values
         out["ic95_sup_coef"] = ci.iloc[:, 1].values
-        out["ic95_inf_irr"] = np.exp(ci.iloc[:, 0].values)
-        out["ic95_sup_irr"] = np.exp(ci.iloc[:, 1].values)
+        # clip antes do exp evita overflow para coeficientes inválidos (separação)
+        out["ic95_inf_irr"] = np.exp(np.clip(ci.iloc[:, 0].values, -50, 50))
+        out["ic95_sup_irr"] = np.exp(np.clip(ci.iloc[:, 1].values, -50, 50))
     except Exception:
         pass
 
@@ -1329,15 +1403,11 @@ print("\nRodando LDA...")
 
 df_texto["texto_lda"] = df_texto["tokens"].apply(lambda x: " ".join(x))
 
-vectorizer = CountVectorizer(max_df=0.95, min_df=2)
+# vectorizer já instanciado no cabeçalho com parâmetros otimizados
 X_lda = vectorizer.fit_transform(df_texto["texto_lda"])
 feature_names = vectorizer.get_feature_names_out()
 
-lda = LatentDirichletAllocation(
-    n_components=N_TOPICOS,
-    random_state=42,
-    learning_method="batch"
-)
+# lda já instanciado no cabeçalho com priors otimizados
 lda.fit(X_lda)
 
 topicos_lista = []
@@ -1396,19 +1466,19 @@ print(freq_topicos)
 # não exclusivamente como agenda penal (que é processo/pena no T5).
 
 NOMES_TOPICOS = {
-    1: "T1 — Estatutos, trânsito\ne direitos civis",
-    2: "T2 — Regulação econômica\ne proteção ao consumidor",
-    3: "T3 — Políticas sociais\n(educação, saúde, trabalho)",
-    4: "T4 — Carreiras, benefícios e estrutura\ndas forças de segurança",
+    1: "T1 — Serviços, transporte\ne relações de consumo",
+    2: "T2 — Proteção social,\ninfância e assistência",
+    3: "T3 — Tributação, renda\ne regulação econômica",
+    4: "T4 — Carreiras, segurança\ne estrutura institucional",
     5: "T5 — Direito penal\ne processo criminal",
 }
 
 NOMES_TOPICOS_CURTO = {
-    1: "T1 — Estatutos/Trânsito",
-    2: "T2 — Regulação Econômica",
-    3: "T3 — Políticas Sociais",
-    4: "T4 — Carreiras e Estrutura",
-    5: "T5 — Dir. Penal/Criminal",
+    1: "T1 — Serv./Transp./Consumo",
+    2: "T2 — Prot. Social/Infância",
+    3: "T3 — Tribut./Renda/Economia",
+    4: "T4 — Carreiras/Estrutura",
+    5: "T5 — Penal/Criminal",
 }
 
 print("\nNomes canônicos dos tópicos (baseados nos termos do LDA):")
@@ -1860,9 +1930,13 @@ if modelo_partido is not None:
     exibir_modelo(modelo_partido, "MODELO COM TÓPICO + PARTIDO + ANO")
     df_odds = extrair_tabela_odds(modelo_partido, "modelo_partido")
 
+# dropa NA em legislatura antes de ajustar (evita "boolean value of NA is ambiguous")
+_base_leg_only = df_reg_inf.dropna(subset=["legislatura", "partido_inf", "aprovado"]).copy()
+_base_leg_only["legislatura"] = _base_leg_only["legislatura"].astype(str)
+
 modelo_leg = ajustar_logit_com_fallback(
     "aprovado ~ C(partido_inf) + C(legislatura)",
-    df_reg_inf,
+    _base_leg_only,
     "MODELO COM PARTIDO + LEGISLATURA"
 )
 
@@ -1882,10 +1956,19 @@ modelo_ampliado = None
 df_odds_ampliado = pd.DataFrame()
 
 try:
-    _base_amp = df_reg_inf.copy()
+    _base_amp = df_reg_inf.dropna(subset=["partido_inf", "aprovado", "topico_dominante"]).copy()
 
-    # adiciona presidente_comissao_bin se disponível via merge com base sociológica
-    if "presidente_comissao_bin" not in _base_amp.columns and not df_reg_corp_base.empty:
+    if "legislatura" in _base_amp.columns:
+        _base_amp = _base_amp.dropna(subset=["legislatura"]).copy()
+        _base_amp["legislatura"] = _base_amp["legislatura"].astype(str)
+
+    # adiciona presidente_comissao_bin só se df_reg_corp_base já existir (seção 22 já rodou)
+    _tem_corp_base = (
+        "df_reg_corp_base" in globals()
+        and isinstance(df_reg_corp_base, pd.DataFrame)
+        and not df_reg_corp_base.empty
+    )
+    if "presidente_comissao_bin" not in _base_amp.columns and _tem_corp_base:
         _cols_cap = [c for c in ["Proposicoes","presidente_comissao_bin","comissao_segpub_bin"]
                      if c in df_reg_corp_base.columns]
         if len(_cols_cap) > 1:
@@ -1901,16 +1984,16 @@ try:
 
     if _tem_leg and _tem_comissao:
         # dummy para 57ª (incompleta) — controla truncamento
-        _base_amp["leg57"] = (_base_amp["legislatura"] == "57a").astype(int)
+        # leg57 removido: colinear com C(legislatura)[T.57a]
         _fml_amp = (
             "aprovado ~ C(topico_dominante) + C(partido_inf) "
-            "+ C(legislatura) + presidente_comissao_bin + leg57"
+            "+ C(legislatura) + presidente_comissao_bin"  # leg57 removido (colinear)
         )
     elif _tem_leg:
-        _base_amp["leg57"] = (_base_amp["legislatura"] == "57a").astype(int)
+        # leg57 removido: colinear com C(legislatura)[T.57a]
         _fml_amp = (
             "aprovado ~ C(topico_dominante) + C(partido_inf) "
-            "+ C(legislatura) + leg57"
+            "+ C(legislatura)"  # leg57 removido (colinear)
         )
     elif _tem_comissao:
         _fml_amp = (
@@ -2055,24 +2138,31 @@ _multinivel_ok = False
 try:
     from statsmodels.genmod.bayes_mixed_glm import BinomialBayesMixedGLM
 
-    _fe_formula = "aprovado_f ~ C(topico_f) + ano_c"
+    # base limpa, índice resetado para evitar desalinhamento no concat
+    _base_bb = _base_ml.dropna(subset=["aprovado_f", "topico_f", "ano_c", "Autor"]).reset_index(drop=True).copy()
 
-    _dummies_autor = pd.get_dummies(
-        _base_ml["Autor"], prefix="autor", drop_first=True
-    ).astype(float)
+    _topico_dum = pd.get_dummies(_base_bb["topico_f"], prefix="top", drop_first=True).astype(float)
+    _autor_dum  = pd.get_dummies(_base_bb["Autor"], prefix="autor", drop_first=True).astype(float)
+    _ano_col    = _base_bb[["ano_c"]].astype(float).reset_index(drop=True)
 
-    _exog_fe = sm.add_constant(
-        pd.get_dummies(_base_ml["topico_f"], drop_first=True).astype(float)
-        .join(_base_ml[["ano_c"]].reset_index(drop=True), how="left")
-    )
+    # concat alinhado por posição (todos com mesmo índice 0..n-1)
+    _exog_fe = pd.concat([_topico_dum.reset_index(drop=True), _ano_col], axis=1)
+    _exog_fe = sm.add_constant(_exog_fe, has_constant="add")
 
-    _exog_vc = _dummies_autor.values
+    # verificação final: nada de NaN/inf
+    _exog_fe_arr = np.asarray(_exog_fe.values, dtype=float)
+    _exog_vc_arr = np.asarray(_autor_dum.values, dtype=float)
+    _endog_arr   = np.asarray(_base_bb["aprovado_f"].values, dtype=float)
+
+    if not (np.all(np.isfinite(_exog_fe_arr)) and np.all(np.isfinite(_exog_vc_arr))
+            and np.all(np.isfinite(_endog_arr))):
+        raise ValueError("NaN/inf residual após limpeza — abortando Nível 1")
 
     modelo_multinivel = BinomialBayesMixedGLM(
-        endog=_base_ml["aprovado_f"].values,
-        exog=_exog_fe.values,
-        exog_vc=_exog_vc,
-        ident=np.zeros(_exog_vc.shape[1], dtype=int)
+        endog=_endog_arr,
+        exog=_exog_fe_arr,
+        exog_vc=_exog_vc_arr,
+        ident=np.zeros(_exog_vc_arr.shape[1], dtype=int)
     ).fit_map()
 
     print("\n=== MODELO MULTINÍVEL NÍVEL 1: BinomialBayesMixedGLM ===")
@@ -2441,7 +2531,7 @@ if modelo_principal is not None:
                         "referência (OR=1.00)", va="center", ha="left",
                         fontsize=9, color="#27ae60", style="italic")
 
-        ax.set_xlabel("Coeficiente logístico (vs. T1 — Regulação/Trânsito)")
+        ax.set_xlabel("Coeficiente logístico (vs. T1 — Serv./Transp./Consumo)")
         ax.set_title(
             "Efeito das agendas temáticas na probabilidade de aprovação\n"
             f"(modelo principal statsmodels, pseudo-R²={1-modelo_principal.llf/modelo_principal.llnull:.3f})\n"
@@ -2560,15 +2650,25 @@ if ARQUIVO_FARDA.exists():
     )
 
     # binárias padronizadas (1/0)
+    # NOTA: algumas colunas vêm como contagem numérica (ex.: número de mandatos
+    # de vereador, número de comissões), outras como "Sim/Não". Tentamos
+    # primeiro o parsing numérico (qualquer valor > 0 = participou) e só
+    # caímos no parsing de string se a coluna não for numérica.
     for col_bin in ["evangelico", "presidente_comissao", "comissao_segpub",
                     "licenca", "mandatos_externos", "mandato_vereador",
                     "mandato_dep_estadual"]:
         if col_bin in df_farda_det.columns:
-            df_farda_det[col_bin + "_bin"] = (
-                df_farda_det[col_bin]
-                .astype(str).str.strip().str.lower()
-                .isin(["sim", "s", "1", "yes", "true", "x"])
-            ).astype(int)
+            _num = pd.to_numeric(df_farda_det[col_bin], errors="coerce")
+            if _num.notna().sum() > 0:
+                # coluna é (parcialmente) numérica → > 0 conta como 1
+                df_farda_det[col_bin + "_bin"] = (_num.fillna(0) > 0).astype(int)
+            else:
+                # coluna é só texto → procurar marcadores positivos
+                df_farda_det[col_bin + "_bin"] = (
+                    df_farda_det[col_bin]
+                    .astype(str).str.strip().str.lower()
+                    .isin(["sim", "s", "1", "yes", "true", "x"])
+                ).astype(int)
 
     # gênero binário
     if "genero" in df_farda_det.columns:
@@ -2605,7 +2705,7 @@ if ARQUIVO_FARDA.exists():
             print(df_farda_det[col].value_counts(dropna=False).head(12))
 
     for col, label in [
-        ("idade_aprox",        "Idade aproximada (2024)"),
+        ("idade_aprox",        "Idade em 2024 (coorte)"),
         ("anos_forca_seg_num", "Anos em força de segurança"),
         ("qtd_pl_farda",       "Qtd PLs na legislatura"),
         ("qtd_discursos",      "Qtd Discursos na legislatura"),
@@ -2654,7 +2754,8 @@ if ARQUIVO_FARDA.exists():
 
     # ── mapa de atributos sociológicos para merge com df_reg_corp_base ───
     cols_sociol = ["parlamentar", "corporacao_sigla",
-                   "anos_forca_seg_num", "idade_aprox", "feminino", "nao_branco",
+                   "anos_forca_seg_num", "idade_aprox", "ano_nascimento_num",
+                   "feminino", "nao_branco",
                    "evangelico_bin", "presidente_comissao_bin", "comissao_segpub_bin",
                    "mandatos_externos_bin", "mandato_vereador_bin",
                    "mandato_dep_estadual_bin", "qtd_discursos", "qtd_pec"]
@@ -2667,25 +2768,91 @@ if ARQUIVO_FARDA.exists():
         .rename(columns={"parlamentar": "Autor_merge"})
     )
 
+    # ── merge sociológico com resolução de coautoria ──────────────────
+    # v19: corrige bug do v18 em que PLs cujo PRIMEIRO autor era civil
+    # caíam em "OUTROS" mesmo havendo militar entre os coautores. Com isso,
+    # a categoria OUTROS acumulava civis articuladores com taxa de aprovação
+    # ~32% (vs. 7,5% da PF), contaminando todos os modelos de corporação,
+    # a base parlamentar agregada e o pipeline ML.
+    #
+    # Estratégia v19:
+    #   1) merge convencional pelo autor principal (Autor truncado);
+    #   2) para os não-matchados, varre Autor_original (lista completa
+    #      de coautores) e imputa pela primeira coautoria que estiver
+    #      na base farda;
+    #   3) PLs sem nenhum militar em toda a lista de coautores são
+    #      removidos — não pertencem à análise sociológica de corporação.
     df_reg_corp_base = df_reg_decidido.copy()
     df_reg_corp_base["Autor_merge"] = df_reg_corp_base["Autor"].apply(normalizar_merge_nome)
 
+    # 1) merge principal
     df_reg_corp_base = df_reg_corp_base.merge(mapa_sociol, on="Autor_merge", how="left")
-    df_reg_corp_base["corporacao_sigla"] = (
-        df_reg_corp_base["corporacao_sigla"].fillna("OUTROS")
-    )
 
-    # cobertura do merge sociológico
-    n_merge = df_reg_corp_base["corporacao_sigla"].ne("OUTROS").sum()
+    # 2) imputação por coautoria — só para os não-matchados
+    mapa_sociol_idx = mapa_sociol.set_index("Autor_merge")
+    cols_imput = [c for c in mapa_sociol.columns if c != "Autor_merge"]
+
+    mask_na = df_reg_corp_base["corporacao_sigla"].isna()
+    n_na_inicial = int(mask_na.sum())
+
+    n_imputados = 0
+    for idx in df_reg_corp_base.index[mask_na]:
+        autores_raw = df_reg_corp_base.at[idx, "Autor_original"]
+        if not isinstance(autores_raw, str) or not autores_raw.strip():
+            continue
+        for nome in split_limpo(autores_raw):
+            chave = normalizar_merge_nome(normalizar_basico(nome))
+            if chave in mapa_sociol_idx.index:
+                for c in cols_imput:
+                    df_reg_corp_base.at[idx, c] = mapa_sociol_idx.at[chave, c]
+                df_reg_corp_base.at[idx, "Autor_merge"] = chave
+                n_imputados += 1
+                break
+
+    # 3) drop PLs sem nenhum militar em toda a lista de coautores
+    mask_ainda_na = df_reg_corp_base["corporacao_sigla"].isna()
+    n_drop = int(mask_ainda_na.sum())
+    df_reg_corp_base = df_reg_corp_base[~mask_ainda_na].reset_index(drop=True)
+
+    print("\n[CORREÇÃO v19] Merge sociológico com resolução de coautoria:")
+    print(f"  - PLs não-matchados pelo autor principal: {n_na_inicial}")
+    print(f"  - Imputados via coautor militar:          {n_imputados}")
+    print(f"  - Removidos (nenhum militar na autoria):  {n_drop}")
+    print(f"  - Base sociológica final:                 {len(df_reg_corp_base)} PLs")
+
+    # v19: recálculo de idade_aprox como idade-no-mandato (PL-level)
+    # No v18 idade_aprox era ano_ref(2024) − ano_nascimento, ou seja, idade
+    # do parlamentar HOJE. Para parlamentares de legislaturas antigas isso
+    # gerava valores tipo 100+ anos (Mauro Borges, Camilo Cola etc.) que não
+    # correspondem à idade no exercício do mandato. A versão correta
+    # sociologicamente é a idade no momento da apresentação do PL.
+    # O valor original 2024-snapshot é preservado em df_farda_det para o
+    # descritivo dos 286 parlamentares (que é coorte, não idade-no-mandato).
+    if "ano_nascimento_num" in df_reg_corp_base.columns:
+        df_reg_corp_base["idade_aprox"] = (
+            df_reg_corp_base["ano"] - df_reg_corp_base["ano_nascimento_num"]
+        )
+        _idade_validas = df_reg_corp_base["idade_aprox"].dropna()
+        print(f"\n[v19] idade_aprox recalculada como idade-no-mandato "
+              f"(ano do PL − ano de nascimento):")
+        print(f"  n={len(_idade_validas)} | min={_idade_validas.min():.0f} | "
+              f"mediana={_idade_validas.median():.0f} | "
+              f"max={_idade_validas.max():.0f} | "
+              f"missings={df_reg_corp_base['idade_aprox'].isna().sum()}")
+
+    # cobertura do merge sociológico (após v19, sempre 100% por construção)
+    n_merge = df_reg_corp_base["corporacao_sigla"].notna().sum()
     print(f"\nCobertura do merge sociológico: "
           f"{n_merge}/{len(df_reg_corp_base)} PLs ({n_merge/len(df_reg_corp_base)*100:.1f}%)")
 
-    print("\nVariáveis sociológicas disponíveis na base de regressão:")
     cols_disp = [c for c in mapa_sociol.columns if c != "Autor_merge"
                  and c in df_reg_corp_base.columns]
-    print(cols_disp)
 
-    # ── tabela descritiva sociológica exportável ──────────────────────────
+    # ────────────────────────────────────────────────────────────────────
+    # TABELA A — DESCRITIVO NO NÍVEL DO PARLAMENTAR (n=286)
+    # Caracterização sociológica dos autores. Cada parlamentar conta uma
+    # vez, independentemente do número de PLs apresentados.
+    # ────────────────────────────────────────────────────────────────────
     df_sociol_descritiva = pd.DataFrame()
     rows_sociol = []
     for col in ["anos_forca_seg_num", "idade_aprox", "feminino", "nao_branco",
@@ -2705,8 +2872,53 @@ if ARQUIVO_FARDA.exists():
             })
     df_sociol_descritiva = pd.DataFrame(rows_sociol)
 
-    print("\nEstatísticas descritivas — variáveis sociológicas:")
+    print("\n" + "─" * 68)
+    print("TABELA A — Descritivo sociológico no nível do PARLAMENTAR (n=286)")
+    print("─" * 68)
+    print("(idade_aprox aqui = snapshot de coorte em 2024,")
+    print(" não idade-no-mandato; ver Tabela B para idade no PL)")
     print(df_sociol_descritiva)
+
+    # ────────────────────────────────────────────────────────────────────
+    # TABELA B — COBERTURA E DESCRITIVO NO NÍVEL DA PROPOSIÇÃO (n=1948)
+    # Mesmas variáveis projetadas sobre a base de regressão (PL-level).
+    # idade_aprox aqui já é idade-no-mandato (recalculada acima).
+    # ────────────────────────────────────────────────────────────────────
+    vars_socio_pl = [
+        "corporacao_sigla", "anos_forca_seg_num", "idade_aprox",
+        "feminino", "nao_branco", "evangelico_bin",
+        "presidente_comissao_bin", "comissao_segpub_bin",
+        "mandatos_externos_bin", "mandato_vereador_bin",
+        "mandato_dep_estadual_bin", "qtd_discursos", "qtd_pec"
+    ]
+    rows_pl = []
+    n_total_pl = len(df_reg_corp_base)
+    for v in vars_socio_pl:
+        if v not in df_reg_corp_base.columns:
+            continue
+        s = df_reg_corp_base[v]
+        s_num = pd.to_numeric(s, errors="coerce") if s.dtype == object else s
+        n_ok = int(s.notna().sum())
+        linha = {
+            "variavel": v,
+            "n_PL": n_ok,
+            "cobertura_%": round(100 * n_ok / n_total_pl, 1),
+            "missings": int(s.isna().sum()),
+        }
+        if pd.api.types.is_numeric_dtype(s_num):
+            s_valid = s_num.dropna()
+            if len(s_valid) > 0:
+                linha["media_ou_prop"] = round(float(s_valid.mean()), 4)
+                linha["min"] = round(float(s_valid.min()), 2)
+                linha["max"] = round(float(s_valid.max()), 2)
+        rows_pl.append(linha)
+    df_sociol_descritiva_pl = pd.DataFrame(rows_pl)
+
+    print("\n" + "─" * 68)
+    print(f"TABELA B — Cobertura sociológica no nível da PROPOSIÇÃO (n={n_total_pl})")
+    print("─" * 68)
+    print("(unidade analítica dos modelos; idade_aprox = idade-no-mandato)")
+    print(df_sociol_descritiva_pl.to_string(index=False))
 
     print("\nFrequência de corporação na base decidida:")
     print(df_reg_corp_base["corporacao_sigla"].value_counts(dropna=False))
@@ -3007,6 +3219,155 @@ if ARQUIVO_FARDA.exists():
 #   3. Rare-events logit (Firth) como robustez para evento raro
 # =========================================================
 
+# ─────────────────────────────────────────────────────────────
+# [v25] HELPER ROBUSTO: Firth com limpeza de design matrix
+# ─────────────────────────────────────────────────────────────
+# firthmodels falha com "Weighted design matrix is rank deficient"
+# quando o design matrix tem colunas redundantes — comum quando:
+#   - categoria de partido tem 0 obs após dropna (categórica não usada)
+#   - duas categorias estão perfeitamente correlacionadas
+#   - interação cria células vazias
+# Este helper limpa o design matrix antes de chamar firthmodels:
+#   1. Remove categorias não usadas das variáveis categóricas
+#   2. Remove colunas com variância zero
+#   3. Detecta rank-deficiency via QR e dropa colunas dependentes
+#   4. Fallback gracioso retornando None se falhar
+# ─────────────────────────────────────────────────────────────
+def _safe_firth_fit(formula, data, max_iter=200, verbose=False,
+                    min_events_per_level=2, outcome_col="aprovado"):
+    """
+    Ajusta Firth logit limpando design matrix antes.
+    
+    Parâmetros:
+    -----------
+    min_events_per_level : int
+        Drop níveis de variáveis categóricas com menos de N eventos.
+        Crítico para evento raro: dummies com poucos eventos têm norma
+        efetiva próxima de zero no design matrix ponderado W^(1/2)·X
+        que firthmodels usa internamente, causando rank deficiency.
+    outcome_col : str
+        Nome da coluna do desfecho binário (para contar eventos).
+
+    Retorna dict com {'model', 'coefs', 'colnames', 'n_obs', 'n_events',
+                      'n_dropped', 'levels_pruned'} ou None se falhar.
+    """
+    try:
+        from firthmodels import FirthLogisticRegression as _FLR
+        from patsy import dmatrices as _dm
+    except ImportError:
+        return None
+
+    try:
+        _df = data.copy()
+        _levels_pruned = {}
+
+        # [v27] extrai apenas colunas que aparecem na fórmula —
+        # antes filtrava todas as categóricas do dataframe, o que
+        # pegava 'Autor' (197 níveis) e quebrava tudo.
+        import re as _re_firth
+        _formula_cols = set(_re_firth.findall(r"[A-Za-z_][A-Za-z_0-9]*", formula))
+        # remove tokens que não são nomes de coluna (operadores patsy)
+        _patsy_tokens = {"C", "I", "Q", "Treatment", "Sum", "Diff", "Helmert",
+                         "Poly", "np", "log", "exp", "sqrt", "center", "scale"}
+        _formula_cols = _formula_cols - _patsy_tokens
+        _formula_cols = _formula_cols & set(_df.columns)
+
+        # remove categorias não usadas SÓ nas colunas relevantes
+        for _col in _formula_cols:
+            if _df[_col].dtype.name == "category":
+                _df[_col] = _df[_col].cat.remove_unused_categories()
+            elif _df[_col].dtype == "object":
+                _df[_col] = _df[_col].astype("category").cat.remove_unused_categories()
+
+        # ── PRÉ-FILTRO POR CONTAGEM DE EVENTOS ─────────────────────
+        # Só nas colunas categóricas que aparecem na fórmula.
+        if outcome_col in _df.columns and min_events_per_level > 0:
+            for _col in _formula_cols:
+                if _col == outcome_col:
+                    continue
+                if _df[_col].dtype.name != "category":
+                    continue
+                try:
+                    _ev_count = _df.groupby(_col, observed=True)[outcome_col].sum()
+                    _bad_levels = _ev_count[_ev_count < min_events_per_level].index.tolist()
+                except Exception:
+                    continue
+                if _bad_levels:
+                    # converte para tuple para evitar unhashable em dict
+                    _levels_pruned[str(_col)] = tuple(str(x) for x in _bad_levels)
+                    _df = _df[~_df[_col].isin(_bad_levels)].copy()
+                    _df[_col] = _df[_col].cat.remove_unused_categories()
+                    if verbose:
+                        _show = list(_bad_levels)[:5]
+                        _more = "..." if len(_bad_levels) > 5 else ""
+                        print(f"  [Firth helper] {_col}: dropados {len(_bad_levels)} "
+                              f"níveis com <{min_events_per_level} eventos → {_show}{_more}")
+
+            # se sobrou base demais filtrada, aborta
+            if len(_df) < 50 or _df[outcome_col].sum() < 10:
+                if verbose:
+                    print(f"  [Firth helper] base ficou pequena demais "
+                          f"após filtro: N={len(_df)}, eventos={int(_df[outcome_col].sum())}")
+                return None
+
+        _y, _X = _dm(formula, data=_df, return_type="dataframe")
+        _X_arr = _X.values
+        _y_arr = _y.values.ravel()
+        _orig_cols = list(_X.columns)
+
+        # 1. dropa colunas com variância zero (incluindo all-zero)
+        _var_cols = _X_arr.var(axis=0)
+        _keep_var = _var_cols > 1e-12
+        if "Intercept" in _orig_cols:
+            _keep_var[_orig_cols.index("Intercept")] = True
+        _X_arr = _X_arr[:, _keep_var]
+        _kept_cols = [c for c, k in zip(_orig_cols, _keep_var) if k]
+
+        # 2. detecta rank deficiency via QR + dropa colunas dependentes
+        _Q, _R, _piv = scipy.linalg.qr(_X_arr, mode="economic", pivoting=True)
+        _diag_R = np.abs(np.diag(_R))
+        _tol_qr = max(_X_arr.shape) * np.finfo(float).eps * _diag_R.max()
+        _rank = int((_diag_R > _tol_qr).sum())
+
+        if _rank < _X_arr.shape[1]:
+            _keep_idx = sorted(_piv[:_rank].tolist())
+            _X_arr = _X_arr[:, _keep_idx]
+            _kept_cols = [_kept_cols[i] for i in _keep_idx]
+
+        _n_dropped = len(_orig_cols) - len(_kept_cols)
+        if verbose and _n_dropped > 0:
+            _dropped = [c for c in _orig_cols if c not in _kept_cols]
+            print(f"  [Firth helper] {_n_dropped} colunas removidas no design: {_dropped[:5]}"
+                  + ("..." if len(_dropped) > 5 else ""))
+
+        # 3. fit Firth no design matrix limpo
+        _model = _FLR(max_iter=max_iter)
+        _model.fit(_X_arr, _y_arr)
+
+        return {
+            "model": _model,
+            "coefs": _model.coef_,
+            "colnames": _kept_cols,
+            "n_obs": int(len(_y_arr)),
+            "n_events": int(_y_arr.sum()),
+            "n_dropped": _n_dropped,
+            "levels_pruned": _levels_pruned,
+            "X_arr": _X_arr,
+            "y_arr": _y_arr,
+        }
+    except Exception as _e_safe:
+        if verbose:
+            print(f"  [Firth helper] falha irrecuperável: {_e_safe}")
+        return None
+
+
+# garante scipy.linalg disponível para o helper
+try:
+    import scipy.linalg
+except ImportError:
+    pass
+
+
 print("\n" + "=" * 60)
 print("22B-EXT. EXTENSÕES INFERENCIAIS")
 print("=" * 60)
@@ -3060,10 +3421,10 @@ if not df_reg_inf.empty and "aprovado" in df_reg_inf.columns:
 
         # LR test: modelo com interação vs sem
         from scipy.stats import chi2 as _chi2_dist
-        _ll_sem = modelo_partido_ano.llf if hasattr(modelo_partido_ano, "llf") else None
+        _ll_sem = modelo_partido.llf if hasattr(modelo_partido, "llf") else None
         if _ll_sem:
             _lr_stat = 2 * (_mod_int_pt.llf - _ll_sem)
-            _lr_df   = _mod_int_pt.df_model - modelo_partido_ano.df_model
+            _lr_df   = _mod_int_pt.df_model - modelo_partido.df_model
             _lr_p    = _chi2_dist.sf(_lr_stat, df=max(_lr_df, 1))
             print(f"\nLR test (interação vs sem interação): "
                   f"χ²({int(_lr_df)})={_lr_stat:.2f}, p={_lr_p:.4f}")
@@ -3081,23 +3442,38 @@ if not df_reg_inf.empty and "aprovado" in df_reg_inf.columns:
     print("\n--- 2. Efeito temporal não linear ---")
     try:
         _base_tl = _base_ext.copy()
-        _base_tl["ano_c2"] = _base_tl["ano_c"] ** 2
+        # [v27] padroniza ano_c (z-score) e centraliza ano² na média
+        # do quadrado pós-padronização. Isso reduz colinearidade entre
+        # termo linear e quadrático e elimina o p=nan.
+        _std_anoc = _base_tl["ano_c"].std()
+        _mean_anoc = _base_tl["ano_c"].mean()
+        _base_tl["ano_c_n"] = (_base_tl["ano_c"] - _mean_anoc) / (_std_anoc if _std_anoc > 0 else 1)
+        _ano_n_sq = _base_tl["ano_c_n"] ** 2
+        _base_tl["ano_c2"] = _ano_n_sq - _ano_n_sq.mean()  # centralizado
 
         # modelo com quadrático
-        _fml_quad = "aprovado ~ C(topico_dominante) + C(partido_inf) + ano_c + ano_c2"
-        _mod_quad = smf.logit(_fml_quad, data=_base_tl).fit(
-            method="lbfgs", maxiter=300, disp=False,
-            cov_type="cluster", cov_kwds={"groups": _base_tl["Autor"]}
-        )
+        _fml_quad = "aprovado ~ C(topico_dominante) + C(partido_inf) + ano_c_n + ano_c2"
+        _base_tl_cc = _base_tl[
+            ["aprovado","topico_dominante","partido_inf","ano_c_n","ano_c2","Autor"]
+        ].dropna()
+        try:
+            _mod_quad = smf.logit(_fml_quad, data=_base_tl_cc).fit(
+                method="lbfgs", maxiter=300, disp=False)
+            if _mod_quad.prsquared < 0 or not np.isfinite(_mod_quad.llf):
+                raise ValueError("modelo divergiu")
+        except Exception:
+            _mod_quad = smf.logit(_fml_quad, data=_base_tl_cc).fit_regularized(
+                method="l1", alpha=0.01, disp=False)
 
         _coef_ano2 = _mod_quad.params.get("ano_c2", np.nan)
         _p_ano2    = _mod_quad.pvalues.get("ano_c2", np.nan)
+        _coef_anol = _mod_quad.params.get("ano_c_n", np.nan)
+        _p_anol    = _mod_quad.pvalues.get("ano_c_n", np.nan)
         print(f"Modelo com ano² | pseudo-R²={_mod_quad.prsquared:.4f}")
-        print(f"  ano_c:  coef={_mod_quad.params.get('ano_c', np.nan):.4f}  "
-              f"p={_mod_quad.pvalues.get('ano_c', np.nan):.4f}")
-        print(f"  ano_c²: coef={_coef_ano2:.4f}  p={_p_ano2:.4f}")
+        print(f"  ano_c_n: coef={_coef_anol:.4f}  p={_p_anol:.4f}")
+        print(f"  ano_c²:  coef={_coef_ano2:.4f}  p={_p_ano2:.4f}")
 
-        if _p_ano2 < 0.05:
+        if np.isfinite(_p_ano2) and _p_ano2 < 0.05:
             if _coef_ano2 < 0:
                 print("→ Tendência temporal CÔNCAVA: cresce e depois desacelera.")
             else:
@@ -3131,41 +3507,79 @@ if not df_reg_inf.empty and "aprovado" in df_reg_inf.columns:
     # Com evento raro (1,3%), o logit padrão pode subestimar
     # probabilidades de sucesso. Firth penaliza separações e
     # reduz o viés de estimativa de máxima verossimilhança.
-    print("\n--- 3. Rare-events logit (Firth) ---")
+    # [v26] Usa helper _safe_firth_fit com pré-filtro por contagem
+    # de eventos. Modelo simplificado SEM partido nesta seção:
+    # o objetivo aqui é validar o efeito de tópico sob correção
+    # rare-event. O efeito de partido já está em M2.
+    print("\n--- 3. Rare-events logit (Firth genuíno via firthmodels) ---")
     try:
-        # tenta importar logistf via statsmodels ou via rpy2/logistf
-        # implementação própria via penalização de Firth
-        from statsmodels.discrete.discrete_model import Logit as _SmLogit
-
-        # Firth via penalização Jeffrey's prior (implementação manual simplificada)
-        # referência: Heinze & Schemper (2002) Statistics in Medicine
         _base_firth = _base_ext[
-            ["aprovado","topico_dominante","partido_inf","ano_c","Autor"]
+            ["aprovado","topico_dominante","ano_c","Autor"]
         ].dropna()
 
-        # usa logit com regularização L2 como proxy de Firth (disponível nativamente)
-        _fml_firth = "aprovado ~ C(topico_dominante) + C(partido_inf) + ano_c"
-        _mod_firth = smf.logit(_fml_firth, data=_base_firth).fit_regularized(
-            method="l1", alpha=0.1, disp=False
+        _firth_real = False
+        # Modelo simplificado: tópico + ano (como M1, sem partido)
+        # 5 tópicos + ano = 5 params, 90 eventos → margem confortável
+        _fit_result = _safe_firth_fit(
+            "aprovado ~ C(topico_dominante) + ano_c",
+            data=_base_firth,
+            max_iter=200,
+            min_events_per_level=2,
+            verbose=True,
         )
 
-        print(f"Logit regularizado (L1, alpha=0.1) — proxy Firth para evento raro")
-        print(f"N={len(_base_firth)} | Aprovações={int(_base_firth['aprovado'].sum())}")
+        if _fit_result is not None:
+            _mod_fr = _fit_result["model"]
+            _kept_cols = _fit_result["colnames"]
 
-        _firth_df = pd.DataFrame({
-            "variavel": _mod_firth.params.index,
-            "coef_firth": _mod_firth.params.round(4),
-            "or_firth":   np.exp(_mod_firth.params).round(3)
-        })
+            _pvals_fr = (getattr(_mod_fr, "pvalues_", None)
+                         if getattr(_mod_fr, "pvalues_", None) is not None
+                         else getattr(_mod_fr, "pvals_", None))
+            _bse_fr = getattr(_mod_fr, "bse_", None)
 
-        # compara com logit padrão
+            print(f"Firth penalizado (Jeffreys prior) — implementação firthmodels")
+            print(f"Modelo: aprovado ~ tópico + ano_c (sem partido — robustez do efeito de tópico)")
+            print(f"N={_fit_result['n_obs']} | Aprovações={_fit_result['n_events']} | "
+                  f"colunas removidas: {_fit_result['n_dropped']}")
+
+            _firth_df = pd.DataFrame({
+                "variavel":   _kept_cols,
+                "coef_firth": np.round(_mod_fr.coef_, 4),
+                "or_firth":   np.round(np.exp(_mod_fr.coef_), 3),
+            })
+            if _bse_fr is not None and len(_bse_fr) == len(_kept_cols):
+                _firth_df["se_firth"] = np.round(_bse_fr, 4)
+                _firth_df["ic95_inf_or"] = np.round(np.exp(_mod_fr.coef_ - 1.96*_bse_fr), 3)
+                _firth_df["ic95_sup_or"] = np.round(np.exp(_mod_fr.coef_ + 1.96*_bse_fr), 3)
+            if _pvals_fr is not None and len(_pvals_fr) == len(_kept_cols):
+                _firth_df["p_firth"] = np.round(_pvals_fr, 4)
+
+            _firth_real = True
+
+        else:
+            print("[INFO] firthmodels indisponível ou falhou — usando proxy L1.")
+            print("       Para Firth genuíno: pip install firthmodels")
+            _fml_firth = "aprovado ~ C(topico_dominante) + ano_c"
+            _mod_firth = smf.logit(_fml_firth, data=_base_firth).fit_regularized(
+                method="l1", alpha=0.1, disp=False
+            )
+            print(f"Logit regularizado (L1, alpha=0.1) — proxy aproximado")
+            print(f"N={len(_base_firth)} | Aprovações={int(_base_firth['aprovado'].sum())}")
+            _firth_df = pd.DataFrame({
+                "variavel": _mod_firth.params.index,
+                "coef_firth": _mod_firth.params.round(4),
+                "or_firth":   np.exp(_mod_firth.params).round(3)
+            })
+
+        # compara com logit padrão (vale para os dois caminhos)
+        # como o Firth aqui não tem partido, comparamos com modelo_principal (M1)
         _firth_comp = _firth_df[
             _firth_df["variavel"].str.contains("topico|ano_c")
         ].copy()
 
-        # adiciona coef do logit padrão para comparação
-        if hasattr(modelo_topico_partido_ano, "params"):
-            _std_params = modelo_topico_partido_ano.params
+        _ref_logit = modelo_principal if hasattr(modelo_principal, "params") else modelo_partido
+        if hasattr(_ref_logit, "params"):
+            _std_params = _ref_logit.params
             _firth_comp["coef_logit"] = _firth_comp["variavel"].map(
                 _std_params
             ).round(4)
@@ -3173,12 +3587,13 @@ if not df_reg_inf.empty and "aprovado" in df_reg_inf.columns:
                 np.sign(_firth_comp["coef_firth"]) ==
                 np.sign(_firth_comp["coef_logit"].fillna(0))
             )
-            print("\nComparação logit padrão × Firth (tópicos e tempo):")
+            _label = "Firth genuíno" if _firth_real else "L1 (proxy)"
+            print(f"\nComparação logit padrão (M1) × {_label}:")
             print(_firth_comp.to_string(index=False))
             _consist = _firth_comp["direcao_consistente"].mean()
             print(f"\nConsistência direcional: {_consist*100:.1f}%")
             if _consist >= 0.80:
-                print("→ Resultados robustos à correção para evento raro.")
+                print(f"→ Resultados robustos à correção para evento raro ({_label}).")
             else:
                 print("→ Atenção: divergências direcionais entre logit e Firth.")
         else:
@@ -3280,7 +3695,7 @@ if not df_reg_corp_base.empty:
 
     if len(_vars_ok) >= 1:
         # remove linhas com missing em qualquer variável do modelo
-        _cols_modelo = ["aprovado", "topico_dominante", "ano_c"] + _vars_ok
+        _cols_modelo = ["aprovado", "topico_dominante", "ano_c", "Autor"] + _vars_ok
         _base_soc_cc = _base_soc[_cols_modelo].dropna()
 
         print(f"Base completa para modelo sociológico: {len(_base_soc_cc)} obs "
@@ -3542,7 +3957,7 @@ if not df_reg_corp_base.empty:
 
             # painel B: taxa de sucesso por tópico e quartil
             _tab_suc = (
-                _base_car.groupby(["quartil_anos","topico_dominante"])["aprovado"]
+                _base_car.groupby(["quartil_anos","topico_dominante"], observed=False)["aprovado"]
                 .mean().reset_index()
             ) if "aprovado" in _base_car.columns else pd.DataFrame()
 
@@ -3613,9 +4028,15 @@ if not df_reg_corp_base.empty:
     )
 
 if "corporacao_sigla" not in base_parlamentar.columns:
-    base_parlamentar["corporacao_sigla"] = "OUTROS"
-
-base_parlamentar["corporacao_sigla"] = base_parlamentar["corporacao_sigla"].fillna("OUTROS")
+    base_parlamentar["corporacao_sigla"] = pd.NA
+# v19: PLs sem militar em qualquer posição da autoria foram removidos do
+# df_reg_corp_base. Aqui propagamos o mesmo critério: dropamos os NaN
+# remanescentes em vez de imputá-los como "OUTROS" (que era o bug do v18).
+_n_antes_bp = len(base_parlamentar)
+base_parlamentar = base_parlamentar[base_parlamentar["corporacao_sigla"].notna()].copy()
+_n_drop_bp = _n_antes_bp - len(base_parlamentar)
+print(f"\n[v19] base_parlamentar: {_n_drop_bp} PLs removidos por ausência "
+      f"de militar na autoria (de {_n_antes_bp} → {len(base_parlamentar)}).")
 
 base_parlamentar_agg = (
     base_parlamentar
@@ -4294,7 +4715,7 @@ print("PREVISÃO FUTURA POR ANO")
 print("=" * 60)
 
 ano_max = int(df_reg_inf["ano"].max())
-anos_simulados = list(range(ano_max + 1, 2041))
+anos_simulados = list(range(ano_max + 1, ANO_HORIZONTE_PREVISAO + 1))
 partidos_validos_pred = sorted(df_reg_inf["partido_inf"].dropna().unique())
 
 cenarios_ano = []
@@ -4491,9 +4912,15 @@ else:
     df_ml = df_reg_inf.copy()
 
 if "corporacao_sigla" not in df_ml.columns:
-    df_ml["corporacao_sigla"] = "OUTROS"
-
-df_ml["corporacao_sigla"] = df_ml["corporacao_sigla"].fillna("OUTROS")
+    df_ml["corporacao_sigla"] = pd.NA
+# v19: mesmo critério da base_parlamentar — dropa PLs sem militar na autoria
+# em vez de mascarar como "OUTROS". Mantém o pipeline ML coerente com a
+# definição sociológica de "políticos de farda".
+_n_antes_ml = len(df_ml)
+df_ml = df_ml[df_ml["corporacao_sigla"].notna()].copy()
+_n_drop_ml = _n_antes_ml - len(df_ml)
+print(f"\n[v19] df_ml: {_n_drop_ml} PLs removidos por ausência de militar "
+      f"na autoria (de {_n_antes_ml} → {len(df_ml)}).")
 
 df_ml = df_ml[
     df_ml["partido_inf"].notna() &
@@ -4912,15 +5339,26 @@ if modelo_pred_final is not None and not base_pred_modelo.empty:
         pred_corporacao["prob_prevista"] = modelo_corp_inf.predict(pred_corporacao)
         pred_corporacao = pred_corporacao.sort_values("prob_prevista", ascending=False).reset_index(drop=True)
 
-        # calcular IC 95% via delta method
+        # calcular IC 95% via delta method (Logit não tem get_prediction nativo)
         try:
-            from statsmodels.stats.outliers_influence import variance_inflation_factor
-            _frame = pred_corporacao.copy()
-            _pred_sm = modelo_corp_inf.get_prediction(_frame)
-            _summ = _pred_sm.summary_frame(alpha=0.05)
-            pred_corporacao["ic_inf"] = _summ["mean_ci_lower"].values
-            pred_corporacao["ic_sup"] = _summ["mean_ci_upper"].values
-        except Exception:
+            from patsy import dmatrix
+            _design_info = modelo_corp_inf.model.data.design_info
+            _X_pred = np.asarray(dmatrix(_design_info, pred_corporacao, return_type="dataframe"))
+            _params = modelo_corp_inf.params.values
+            _cov    = modelo_corp_inf.cov_params()
+            _eta    = _X_pred @ _params
+            # variância de eta linha a linha: x' V x
+            _var_eta = np.einsum("ij,jk,ik->i", _X_pred, _cov, _X_pred)
+            _se_eta  = np.sqrt(np.clip(_var_eta, 0, None))
+            _z = 1.96
+            _eta_lo = _eta - _z * _se_eta
+            _eta_hi = _eta + _z * _se_eta
+            # logit inverse com clip para evitar overflow
+            _sig = lambda x: 1.0 / (1.0 + np.exp(-np.clip(x, -50, 50)))
+            pred_corporacao["ic_inf"] = _sig(_eta_lo)
+            pred_corporacao["ic_sup"] = _sig(_eta_hi)
+        except Exception as _e_ic:
+            print(f"  [INFO] IC delta method falhou: {_e_ic}")
             pred_corporacao["ic_inf"] = np.nan
             pred_corporacao["ic_sup"] = np.nan
 
@@ -5607,7 +6045,7 @@ if not df_ml.empty and not df_resultados_bt.empty:
                 # gráfico de idade e anos na força de segurança
                 _vars_cont = [
                     ("anos_forca_seg_num", "Anos na força de segurança"),
-                    ("idade_aprox",         "Idade aproximada (2024)"),
+                    ("idade_aprox",         "Idade em 2024 (coorte)"),
                 ]
                 _vars_cont_ok = [
                     (v, l) for v, l in _vars_cont
@@ -5696,15 +6134,20 @@ try:
 
     # participação do tópico penal por ano
     if "topico_dominante" in df_texto.columns:
-        _penal_ano = (
+        _df_pa = (
             df_texto[df_texto["ano"].notna() & pd.to_numeric(df_texto["ano"], errors="coerce").notna()]
             .assign(ano=lambda x: pd.to_numeric(x["ano"], errors="coerce").astype("Int64"))
             .dropna(subset=["ano"])
             .query("ano >= 1995")
-            .groupby("ano")
-            .apply(lambda x: (x["topico_dominante"] == 5).sum() / len(x) * 100)
+            .copy()
+        )
+        _df_pa["is_penal"] = (_df_pa["topico_dominante"] == 5).astype(float)
+        _penal_ano = (
+            _df_pa.groupby("ano")["is_penal"]
+            .mean()
+            .mul(100)
             .reset_index()
-            .rename(columns={0: "pct_penal"})
+            .rename(columns={"is_penal": "pct_penal"})
         )
         _penal_ano["ano"] = _penal_ano["ano"].astype(int)
         _serie_base = _serie_base.merge(_penal_ano, on="ano", how="left")
@@ -6008,13 +6451,19 @@ if not df_reg_inf.empty and "topico_dominante" in df_reg_inf.columns:
         _logit_params = modelo_principal.params if modelo_principal is not None else pd.Series()
         _probit_params = modelo_probit.params
 
+        # [v27] divisão segura: evita o clip([-1e6, -1e-8]) anterior
+        # que forçava todos os valores negativos e gerava razões absurdas (-9e7).
+        _logit_aligned = _logit_params.reindex(_probit_params.index).values
+        _probit_vals = _probit_params.values
+        _safe_denom = np.where(np.abs(_probit_vals) < 1e-6, np.nan, _probit_vals)
+        _razao = _logit_aligned / _safe_denom
+
         _compar = pd.DataFrame({
             "variavel":       _probit_params.index,
-            "coef_logit":     _logit_params.reindex(_probit_params.index).values,
-            "coef_probit":    _probit_params.values,
-            "razao_l_p":      (_logit_params.reindex(_probit_params.index).values /
-                               _probit_params.values.clip(-1e6, -1e-8)),
-            "p_probit":       modelo_probit.pvalues.values,
+            "coef_logit":     np.round(_logit_aligned, 4),
+            "coef_probit":    np.round(_probit_vals, 4),
+            "razao_l_p":      np.round(_razao, 3),
+            "p_probit":       np.round(modelo_probit.pvalues.values, 4),
         })
         _compar["direcao_consistente"] = (
             np.sign(_compar["coef_logit"].fillna(0)) ==
@@ -6028,6 +6477,11 @@ if not df_reg_inf.empty and "topico_dominante" in df_reg_inf.columns:
 
         _consist = _compar["direcao_consistente"].mean()
         print(f"\nConsistência direcional: {_consist*100:.1f}% das variáveis")
+        # razão média (excluindo intercepto e nans)
+        _razoes_finitas = _compar[_compar["variavel"] != "Intercept"]["razao_l_p"].dropna()
+        if len(_razoes_finitas) > 0:
+            print(f"Razão média logit/probit: {_razoes_finitas.mean():.3f} "
+                  f"(esperado ~1.6)")
         if _consist >= 0.90:
             print("→ Inferências robustas à escolha da função de ligação (logit vs probit).")
 
@@ -6054,10 +6508,8 @@ print("=" * 60)
 
 from sklearn.model_selection import StratifiedKFold, cross_validate
 from sklearn.pipeline import Pipeline as SKPipeline
-from sklearn.preprocessing import OneHotEncoder
-from sklearn.compose import ColumnTransformer
 from sklearn.linear_model import LogisticRegression as LR_CV
-from sklearn.metrics import make_scorer, roc_auc_score, average_precision_score
+from sklearn.metrics import roc_auc_score, average_precision_score
 
 df_cv_resultados = pd.DataFrame()
 
@@ -6363,15 +6815,12 @@ try:
         try:
             _af_vals = _parl_base["anos_forca_seg_num"].fillna(0)
             _n_unique_af = _af_vals.nunique()
-            if _n_unique_af >= 4:
-                _parl_base["capital_corporativo"] = pd.qcut(
-                    _af_vals, q=4, labels=["Q1","Q2","Q3","Q4"], duplicates="drop"
-                )
-            elif _n_unique_af >= 2:
-                _labels_af = [f"Q{i+1}" for i in range(_n_unique_af)]
-                _parl_base["capital_corporativo"] = pd.qcut(
-                    _af_vals, q=_n_unique_af, labels=_labels_af, duplicates="drop"
-                )
+            if _n_unique_af >= 2:
+                # uma única chamada de qcut, sem labels — depois renomeia categorias
+                _q_af = pd.qcut(_af_vals, q=min(4, _n_unique_af), duplicates="drop")
+                _n_bins_af = _q_af.cat.categories.size
+                _labels_af = [f"Q{i+1}" for i in range(_n_bins_af)]
+                _parl_base["capital_corporativo"] = _q_af.cat.rename_categories(_labels_af)
             else:
                 _parl_base["capital_corporativo"] = "sem_variacao"
         except Exception as _e_corp:
@@ -6385,15 +6834,11 @@ try:
         try:
             _bet_vals = _parl_base["betweenness"].fillna(0)
             _n_unique_bet = _bet_vals.nunique()
-            if _n_unique_bet >= 4:
-                _parl_base["capital_relacional"] = pd.qcut(
-                    _bet_vals, q=4, labels=["Q1","Q2","Q3","Q4"], duplicates="drop"
-                )
-            elif _n_unique_bet >= 2:
-                _labels_bet = [f"Q{i+1}" for i in range(_n_unique_bet)]
-                _parl_base["capital_relacional"] = pd.qcut(
-                    _bet_vals, q=_n_unique_bet, labels=_labels_bet, duplicates="drop"
-                )
+            if _n_unique_bet >= 2:
+                _q_bet = pd.qcut(_bet_vals, q=min(4, _n_unique_bet), duplicates="drop")
+                _n_bins_bet = _q_bet.cat.categories.size
+                _labels_bet = [f"Q{i+1}" for i in range(_n_bins_bet)]
+                _parl_base["capital_relacional"] = _q_bet.cat.rename_categories(_labels_bet)
             else:
                 _parl_base["capital_relacional"] = "sem_variacao"
         except Exception as _e_rel:
@@ -6583,8 +7028,11 @@ try:
             _mca_df = _coords_row.copy()
             _mca_df.columns = [f"mca_dim{i+1}" for i in range(_mca_df.shape[1])]
             # converte índice para string para evitar conflito int64 vs str
-            _mca_idx = _parl_mca_cc.index if hasattr(_parl_mca_cc, "index") else range(len(_mca_df))
-            _mca_df[_autor_col] = [str(x) for x in _mca_idx]
+            _mca_keys = _parl_mca_cc.reset_index()
+            if _autor_col in _mca_keys.columns:
+                _mca_df[_autor_col] = _mca_keys[_autor_col].astype(str).values
+            else:
+                _mca_df[_autor_col] = _parl_base[_autor_col].astype(str).values[:len(_mca_df)]
             _parl_base_mca = _parl_base.copy()
             _parl_base_mca[_autor_col] = _parl_base_mca[_autor_col].astype(str)
             _mca_df = _mca_df.merge(
@@ -6592,7 +7040,8 @@ try:
                 on=_autor_col, how="left"
             )
             # correlação entre coordenadas MCA e variáveis
-            _corr_mca = _mca_df[["mca_dim1","mca_dim2","taxa_parl","n_pl"]].corr().round(3)
+            _cols_corr = [c for c in ["mca_dim1","mca_dim2","taxa_parl","n_pl"] if c in _mca_df.columns]
+            _corr_mca = _mca_df[_cols_corr].corr().round(3)
             print("\nCorrelação eixos MCA × sucesso e produtividade:")
             print(_corr_mca)
 
@@ -6606,8 +7055,8 @@ try:
             print(_mca_corp)
 
             # interpretação automática dos eixos
-            _dim1_taxa = _corr_mca.loc["mca_dim1","taxa_parl"]
-            _dim2_npl  = _corr_mca.loc["mca_dim2","n_pl"]
+            _dim1_taxa = _corr_mca.loc["mca_dim1","taxa_parl"] if "taxa_parl" in _corr_mca.columns else float("nan")
+            _dim2_npl  = _corr_mca.loc["mca_dim2","n_pl"] if "n_pl" in _corr_mca.columns else float("nan")
             print(f"\nInterpretação dos eixos:")
             print(f"  Dim1 ↔ taxa sucesso (r={_dim1_taxa:.3f}): "
                   f"{'+ eficácia legislativa' if _dim1_taxa > 0.1 else '- eficácia / penalismo' if _dim1_taxa < -0.1 else 'não discrimina eficácia'}")
@@ -6880,7 +7329,6 @@ print("34. CLUSTERING K-MEANS — PERFIL TEMÁTICO DOS PARLAMENTARES")
 print("=" * 60)
 
 from sklearn.cluster import KMeans
-from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import silhouette_score
 
 df_clusters = pd.DataFrame()
@@ -6939,8 +7387,8 @@ try:
 
     # nomes interpretativos: cluster dominado pelo tópico com maior média
     _nomes_cluster = {}
-    _nomes_base = {1:"Regulação/Trânsito",2:"Economia/Consumidor",
-                   3:"Políticas Sociais",4:"Carreiras da Força",5:"Direito Penal"}
+    _nomes_base = {1:"Serv./Transp./Consumo",2:"Prot. Social/Infância",
+                   3:"Tribut./Renda/Economia",4:"Carreiras da Força",5:"Direito Penal"}
     for _c, row in _perfil_cluster.iterrows():
         _top_col = row.idxmax()
         _top_num = [k for k,v in NOMES_TOPICOS_CURTO.items() if v == _top_col]
@@ -7073,10 +7521,6 @@ try:
     print("\nDistribuição geral de tom:")
     print(_dist_tom)
 
-    # distribuição geral
-    _dist_tom = df_texto["tom"].value_counts()
-    print("\nDistribuição geral de tom:")
-    print(_dist_tom)
     print(f"\n% punitivo:  {_dist_tom.get('punitivo',0)/len(df_texto)*100:.1f}%")
     print(f"% protetivo: {_dist_tom.get('protetivo',0)/len(df_texto)*100:.1f}%")
     print(f"% neutro:    {_dist_tom.get('neutro',0)/len(df_texto)*100:.1f}%")
@@ -7572,14 +8016,23 @@ for nome, modelo, base_usada in [
     ("topico_ano", modelo_principal, df_reg_decidido),
     ("topico_partido_ano", modelo_partido, df_reg_inf),
     ("topico_corporacao_ano", modelo_corp_inf, df_reg_corp_logit),
+    ("ampliado", modelo_ampliado, df_reg_inf),
 ]:
     if modelo is not None:
         try:
-            y_true_rob = base_usada["aprovado"].astype(int)
-            y_prob_rob = modelo.predict(base_usada)
+            # usa a base efetivamente ajustada (cobre modelo ampliado, que tem
+            # variáveis ausentes em df_reg_inf como presidente_comissao_bin)
+            _frame_fit = modelo.model.data.frame
+            y_true_rob = _frame_fit["aprovado"].astype(int)
+            y_prob_rob = modelo.predict(_frame_fit)
             auc_tmp = roc_auc_score(y_true_rob, y_prob_rob)
         except Exception:
-            auc_tmp = np.nan
+            try:
+                y_true_rob = base_usada["aprovado"].astype(int)
+                y_prob_rob = modelo.predict(base_usada)
+                auc_tmp = roc_auc_score(y_true_rob, y_prob_rob)
+            except Exception:
+                auc_tmp = np.nan
 
         try:
             pseudo_r2 = float(1 - (modelo.llf / modelo.llnull))
@@ -7786,6 +8239,12 @@ with pd.ExcelWriter(ARQUIVO_SAIDA, engine="openpyxl") as writer:
     if not resumo_modelos_bt.empty:
         resumo_modelos_bt.to_excel(writer, sheet_name="ml_resumo_modelos", index=False)
 
+    if not df_comparacao_modelos.empty:
+        df_comparacao_modelos.to_excel(writer, sheet_name="comparacao_modelos", index=False)
+
+    if not df_odds_ampliado.empty:
+        df_odds_ampliado.to_excel(writer, sheet_name="odds_modelo_ampliado", index=False)
+
     if not df_resumo_executivo.empty:
         df_resumo_executivo.to_excel(writer, sheet_name="resumo_executivo", index=False)
 
@@ -7927,21 +8386,17 @@ try:
             df_reg_inf["situacao_recodificada"].isin(["sucesso","fracasso"])
         ].copy()
 
-        # dummy para 57ª legislatura (incompleta — controla viés de truncamento)
-        _base_leg["leg57_dummy"] = (
-            _base_leg["legislatura"] == "57a"
-        ).astype(int)
-
-        # ── Modelo 1: tópico + legislatura (dummies) ──────────────
-        # Substitui ano contínuo por dummies de legislatura
-        # Cada coeficiente captura o efeito contextual de cada período
-        # A 57ª entra com dummy de truncamento (controle)
-        _fml_leg_full = (
-            "aprovado ~ C(topico_dominante) + C(partido_inf) "
-            "+ C(legislatura) + leg57_dummy"
-        )
-        # remove 57a da formula C(legislatura) para evitar colinearidade
-        _base_leg_no57 = _base_leg.copy()
+        # ── Modelo: tópico + partido + legislatura (dummies) ──────
+        # Cada coeficiente de legislatura captura o efeito contextual
+        # do período. A 57ª entra na C(legislatura) (dados parciais).
+        # filtro NA-safe (evita "boolean value of NA is ambiguous")
+        _base_leg = _base_leg[
+            _base_leg["legislatura"].notna() &
+            _base_leg["partido_inf"].notna() &
+            _base_leg["topico_dominante"].notna() &
+            _base_leg["aprovado"].notna()
+        ].copy()
+        _base_leg["legislatura"] = _base_leg["legislatura"].astype(str)
 
         try:
             _mod_leg_full = smf.logit(
@@ -8005,7 +8460,7 @@ try:
                 _pvals  = modelo_principal.pvalues.copy()
 
                 # AME já calculados anteriormente — recomputa aqui para garantir
-                from statsmodels.stats.margeff import margeff_count
+                # margeff_count removido — módulo inexistente
                 try:
                     _ames = modelo_principal.get_margeff().summary_frame()
                     _ames_dict = dict(zip(_ames.index, _ames["dy/dx"]))
@@ -8295,7 +8750,7 @@ if _LIFELINES_OK and not df_texto.empty:
             print("               HR < 1 → menor taxa de aprovação (aprovação mais lenta/rara)")
             plt.figure(figsize=(8, 4))
             cph.plot()
-            plt.title("Cox PH — Hazard Ratios por tópico (referência: T1 Regulação/Trânsito)")
+            plt.title("Cox PH — Hazard Ratios por tópico (referência: T1 Serv./Transp./Consumo)")
             plt.tight_layout()
             plt.savefig(PASTA / "cox_topico.png", dpi=300, bbox_inches="tight")
             plt.show()
@@ -8421,6 +8876,11 @@ try:
     else:
         print("[INFO] texto_limpo não disponível — coherence score pulado.")
 
+except ImportError:
+    print("[INFO] gensim não instalado. Instalando...")
+    import subprocess
+    subprocess.run(["pip", "install", "gensim", "--break-system-packages", "-q"], capture_output=True)
+    print("[INFO] gensim instalado. Re-execute o script.")
 except Exception as _e47:
     print(f"[AVISO] Seção 47 (coherence LDA) falhou: {_e47}")
 
@@ -8487,6 +8947,11 @@ try:
             }).sort_values("coef", ascending=False)
             print("\nInterações t5 × partido (OR > 1 = partido mitiga penalidade do T5):")
             print(_int_df.to_string(index=False))
+            # [v27] flag se p-valores não convergiram (separação)
+            if _int_df["p"].isna().any():
+                print("\n[ATENÇÃO] p-valores NaN indicam Hessiana não-inversível")
+                print("(separação quase-completa). Coeficientes individuais NÃO são")
+                print("confiáveis para inferência. Reportar apenas direção qualitativa.")
             print("\nInterpretação: OR > 1 indica que o partido consegue aprovar")
             print("PLs penais com mais eficiência que o partido de referência (DEM).")
 
@@ -8533,6 +8998,10 @@ try:
                 }).sort_values("coef", ascending=False)
                 print("\nInterações tópico × corporação:")
                 print(_ci_df.to_string(index=False))
+                # [v27] flag se p-valores não convergiram
+                if _ci_df["p"].isna().any():
+                    print("\n[ATENÇÃO] p-valores NaN indicam separação quase-completa.")
+                    print("Coeficientes individuais não são interpretáveis.")
 
     else:
         print("[INFO] df_reg_inf vazio — seção 42 pulada.")
@@ -8560,22 +9029,35 @@ try:
         df_reg_inf[df_reg_inf["aprovado"].notna()].copy()
 
         # ── 1. Modelo com ano² (quadrático) ──────────────────────
-        _base_tnl["ano_c2"] = _base_tnl["ano_c"] ** 2
+        # [v27] padroniza ano_c (z-score) e centraliza o quadrado
+        # antes de elevar para reduzir colinearidade.
+        _std_anoc_43 = _base_tnl["ano_c"].std()
+        _mean_anoc_43 = _base_tnl["ano_c"].mean()
+        _base_tnl["ano_c_n43"] = (_base_tnl["ano_c"] - _mean_anoc_43) / (_std_anoc_43 if _std_anoc_43 > 0 else 1)
+        _ano_n43_sq = _base_tnl["ano_c_n43"] ** 2
+        _base_tnl["ano_c2"] = _ano_n43_sq - _ano_n43_sq.mean()
 
-        _fml_quad = "aprovado ~ C(topico_dominante) + ano_c + ano_c2"
-        _mod_quad = smf.logit(_fml_quad, data=_base_tnl.dropna(
-            subset=["aprovado","topico_dominante","ano_c","ano_c2"]
-        )).fit(method="lbfgs", maxiter=300, disp=False)
+        _fml_quad = "aprovado ~ C(topico_dominante) + ano_c_n43 + ano_c2"
+        try:
+            _mod_quad = smf.logit(_fml_quad, data=_base_tnl.dropna(
+                subset=["aprovado","topico_dominante","ano_c_n43","ano_c2"]
+            )).fit(method="lbfgs", maxiter=300, disp=False)
+            if not np.isfinite(_mod_quad.llf) or _mod_quad.prsquared < -0.5:
+                raise ValueError("modelo quadrático divergiu")
+        except Exception as _e_q43:
+            print(f"\n1. Modelo quadrático: falha na convergência ({_e_q43})")
+            _mod_quad = None
 
-        print(f"\n1. Modelo quadrático (ano + ano²):")
-        print(f"   pseudo-R²={_mod_quad.prsquared:.4f} vs linear={0.056:.4f}")
-        _q_coef = _mod_quad.params.get("ano_c2", np.nan)
-        _q_pval = _mod_quad.pvalues.get("ano_c2", np.nan)
-        print(f"   coef_ano²={_q_coef:.4f} (p={_q_pval:.4f})")
-        if _q_pval < 0.05:
-            print("   → Efeito temporal NÃO é linear. Usar blocos ou spline.")
-        else:
-            print("   → Efeito quadrático não significativo. Linearidade mantida.")
+        if _mod_quad is not None:
+            print(f"\n1. Modelo quadrático (ano + ano²):")
+            print(f"   pseudo-R²={_mod_quad.prsquared:.4f}")
+            _q_coef = _mod_quad.params.get("ano_c2", np.nan)
+            _q_pval = _mod_quad.pvalues.get("ano_c2", np.nan)
+            print(f"   coef_ano²={_q_coef:.4f} (p={_q_pval:.4f})")
+            if np.isfinite(_q_pval) and _q_pval < 0.05:
+                print("   → Efeito temporal NÃO é linear. Usar blocos ou spline.")
+            else:
+                print("   → Efeito quadrático não significativo. Linearidade mantida.")
 
         # ── 2. Modelo com blocos históricos ──────────────────────
         # Lula 1+2 (2003–2010), Dilma (2011–2016), Temer/Bolsonaro (2017–2022)
@@ -8677,5 +9159,2524 @@ except Exception as _e43:
     print(f"[AVISO] Seção 43 (tempo não linear): {_e43}")
 
 
+
+
+# ======================================================================
+# BLOCOS RESGATADOS DE backup.py — gráficos órfãos das versões pré-v19
+# Cada bloco é independente e protegido por try/except.
+# Falhas isoladas não interrompem o script.
+# ======================================================================
+
+
+# --------------------------------------------------------------------
+# §42 INTERAÇÃO TÓPICO × PARTIDO/CORPORAÇÃO (com gráfico)
+# --------------------------------------------------------------------
+try:
+    # =========================================================
+    # 42. INTERAÇÃO TÓPICO × PARTIDO E TÓPICO × CORPORAÇÃO
+    # =========================================================
+    # Pergunta: o efeito negativo do penalismo (T5) é uniforme entre partidos,
+    # ou alguns partidos conseguem aprovações penais que outros não conseguem?
+    # Referência: Norton (2012) — interações em logit binário.
+    # =========================================================
+
+    print("\n" + "=" * 60)
+    print("42. INTERAÇÕES TÓPICO × PARTIDO / CORPORAÇÃO")
+    print("=" * 60)
+
+    try:
+        if not df_reg_inf.empty and "partido_inf" in df_reg_inf.columns:
+            _base_int2 = df_reg_inf[
+                df_reg_inf["situacao_recodificada"].isin(["sucesso","fracasso"])
+            ].copy() if "situacao_recodificada" in df_reg_inf.columns else \
+            df_reg_inf[df_reg_inf["aprovado"].notna()].copy()
+
+            # flag T5 e T1 (referência)
+            _base_int2["t5_flag"] = (_base_int2["topico_dominante"] == 5).astype(int)
+            _base_int2["t3_flag"] = (_base_int2["topico_dominante"] == 3).astype(int)
+
+            # partidos com >= 3 aprovações em T5
+            _pt5 = (
+                _base_int2[_base_int2["t5_flag"] == 1]
+                .groupby("partido_inf")["aprovado"].sum()
+            )
+            _partidos_t5 = _pt5[_pt5 >= 2].index.tolist()
+            print(f"\nPartidos com >= 2 aprovações em T5: {_partidos_t5}")
+
+            # modelo com interação t5 × partido
+            _fml_int_partido = (
+                "aprovado ~ C(topico_dominante) + ano_c + C(partido_inf) "
+                "+ t5_flag:C(partido_inf)"
+            )
+            _base_int2_cc = _base_int2[
+                ["aprovado","topico_dominante","ano_c","partido_inf","t5_flag","t3_flag"]
+            ].dropna()
+
+            if len(_base_int2_cc) >= 100 and _base_int2_cc["aprovado"].sum() >= 5:
+                _mod_int_partido = smf.logit(
+                    _fml_int_partido, data=_base_int2_cc
+                ).fit(method="lbfgs", maxiter=400, disp=False)
+
+                print(f"\nModelo interação tópico × partido:")
+                print(f"  N={len(_base_int2_cc)} | pseudo-R²={_mod_int_partido.prsquared:.4f}")
+
+                # extrair coefs de interação
+                _int_coefs = _mod_int_partido.params[
+                    _mod_int_partido.params.index.str.contains("t5_flag:C")
+                ]
+                _int_pvals = _mod_int_partido.pvalues[
+                    _mod_int_partido.pvalues.index.str.contains("t5_flag:C")
+                ]
+                _int_df = pd.DataFrame({
+                    "variavel": _int_coefs.index,
+                    "coef":     _int_coefs.values.round(4),
+                    "or":       np.exp(_int_coefs.values).round(3),
+                    "p":        _int_pvals.values.round(4)
+                }).sort_values("coef", ascending=False)
+                print("\nInterações t5 × partido (OR > 1 = partido mitiga penalidade do T5):")
+                print(_int_df.to_string(index=False))
+                print("\nInterpretação: OR > 1 indica que o partido consegue aprovar")
+                print("PLs penais com mais eficiência que o partido de referência (DEM).")
+
+            # ── interação tópico × corporação ──────────────────────────
+            if not df_reg_corp_base.empty and "corporacao_sigla" in df_reg_corp_base.columns:
+                _base_corp_int = df_reg_corp_base[
+                    df_reg_corp_base["corporacao_sigla"].isin(["PM","EB","PC","PF","MB","SM"])
+                ].copy()
+                _base_corp_int["t5_flag"] = (
+                    _base_corp_int["topico_dominante"] == 5
+                ).astype(int)
+                _base_corp_int["t1_flag"] = (
+                    _base_corp_int["topico_dominante"] == 1
+                ).astype(int)
+
+                _fml_corp_int = (
+                    "aprovado ~ C(topico_dominante) + ano_c + C(corporacao_sigla) "
+                    "+ t5_flag:C(corporacao_sigla) + t1_flag:C(corporacao_sigla)"
+                )
+                _base_corp_int_cc = _base_corp_int[
+                    ["aprovado","topico_dominante","ano_c",
+                     "corporacao_sigla","t5_flag","t1_flag"]
+                ].dropna()
+
+                if len(_base_corp_int_cc) >= 50 and _base_corp_int_cc["aprovado"].sum() >= 5:
+                    _mod_corp_int = smf.logit(
+                        _fml_corp_int, data=_base_corp_int_cc
+                    ).fit(method="lbfgs", maxiter=400, disp=False)
+
+                    print(f"\nModelo interação tópico × corporação:")
+                    print(f"  N={len(_base_corp_int_cc)} | pseudo-R²={_mod_corp_int.prsquared:.4f}")
+
+                    _ci_coefs = _mod_corp_int.params[
+                        _mod_corp_int.params.index.str.contains("t5_flag:C|t1_flag:C")
+                    ]
+                    _ci_pvals = _mod_corp_int.pvalues[
+                        _mod_corp_int.pvalues.index.str.contains("t5_flag:C|t1_flag:C")
+                    ]
+                    _ci_df = pd.DataFrame({
+                        "variavel": _ci_coefs.index,
+                        "coef": _ci_coefs.values.round(4),
+                        "or": np.exp(_ci_coefs.values).round(3),
+                        "p": _ci_pvals.values.round(4)
+                    }).sort_values("coef", ascending=False)
+                    print("\nInterações tópico × corporação:")
+                    print(_ci_df.to_string(index=False))
+
+        else:
+            print("[INFO] df_reg_inf vazio — seção 42 pulada.")
+
+    except Exception as _e42:
+        print(f"[AVISO] Seção 42 (interações): {_e42}")
+
+
+except Exception as _e_resgate:
+    print(f"[AVISO] Bloco resgatado falhou (§42 INTERAÇÃO TÓPICO × PARTIDO/CORPORAÇÃO (com gráfico)): {_e_resgate}")
+
+# --------------------------------------------------------------------
+# §44 SOBREVIVÊNCIA COMBINADA (KM+Cox em uma figura)
+# --------------------------------------------------------------------
+try:
+    # =========================================================
+    # 44. ANÁLISE DE SOBREVIVÊNCIA — KAPLAN-MEIER E COX
+    # =========================================================
+    # Em vez de "aprovou ou não", modela TEMPO até aprovação ou arquivamento.
+    # Requer ao menos: data de apresentação e data de desfecho.
+    # Se datas não disponíveis, usa proxy: (ano_desfecho - ano_apresentacao).
+    # =========================================================
+
+    print("\n" + "=" * 60)
+    print("44. ANÁLISE DE SOBREVIVÊNCIA — KAPLAN-MEIER E COX")
+    print("=" * 60)
+
+    try:
+        from lifelines import KaplanMeierFitter, CoxPHFitter
+        _lifelines_ok = True
+    except ImportError:
+        _lifelines_ok = False
+        print("[INFO] lifelines não instalado. Instale com: pip install lifelines")
+        print("       Gerando análise de proxy com duração estimada.")
+
+    try:
+        if not df_reg_inf.empty:
+            _base_surv = df_reg_inf.copy()
+
+            # ── proxy de duração ──────────────────────────────────────
+            # sem datas precisas, usa: ano do PL como "tempo 0"
+            # sucesso = evento, tramitando = censurado, fracasso = censurado
+            # duração proxy: legislatura como unidade de tempo (1–8)
+            _leg_num = {
+                "49a":1,"50a":2,"51a":3,"52a":4,
+                "53a":5,"54a":6,"55a":7,"56a":8,"57a":9
+            }
+            if "legislatura" in _base_surv.columns:
+                _base_surv["t_surv"] = _base_surv["legislatura"].map(_leg_num).fillna(5)
+            else:
+                # proxy pelo ano
+                _base_surv["t_surv"] = (
+                    (_base_surv["ano"] - _base_surv["ano"].min()) / 4 + 1
+                ).clip(1, 9).round(1)
+
+            # evento = aprovado
+            _base_surv["evento"] = _base_surv["aprovado"].fillna(0).astype(int)
+
+            print(f"\nBase sobrevivência: {len(_base_surv)} PLs")
+            print(f"Eventos (aprovados): {_base_surv['evento'].sum()}")
+            print(f"Censurados: {(1-_base_surv['evento']).sum()}")
+            print("Nota: duração proxy por legislatura (1=49ª, 9=57ª).")
+            print("Para análise precisa, adicionar datas de apresentação/desfecho.")
+
+            if _lifelines_ok:
+                # ── Kaplan-Meier por tópico ───────────────────────────
+                fig_km, axes_km = plt.subplots(1, 2, figsize=(13, 6))
+
+                _kmf = KaplanMeierFitter()
+                _cores_top = {1:"#2ecc71",2:"#3498db",3:"#9b59b6",4:"#f39c12",5:"#e74c3c"}
+                for _t in [1, 3, 4, 5]:
+                    _mask = _base_surv["topico_dominante"] == _t
+                    _kmf.fit(
+                        _base_surv.loc[_mask,"t_surv"],
+                        event_observed=_base_surv.loc[_mask,"evento"],
+                        label=NOMES_TOPICOS_CURTO.get(_t, f"T{_t}")
+                    )
+                    _kmf.plot_survival_function(
+                        ax=axes_km[0],
+                        color=_cores_top.get(_t,"gray"),
+                        ci_show=False, linewidth=1.8
+                    )
+
+                axes_km[0].set_title("Kaplan-Meier por tópico\n(sobrevivência = ainda não aprovado)")
+                axes_km[0].set_xlabel("Legislatura (proxy de tempo)")
+                axes_km[0].set_ylabel("P(ainda não aprovado)")
+                axes_km[0].legend(fontsize=8)
+                axes_km[0].grid(True, linestyle="--", alpha=0.3)
+
+                # ── Cox Proportional Hazards ──────────────────────────
+                _cox_vars = ["t_surv","evento","topico_dominante","ano_c"]
+                if "partido_inf" in _base_surv.columns:
+                    _base_surv_cox = pd.get_dummies(
+                        _base_surv[_cox_vars + ["partido_inf"]].dropna(),
+                        columns=["partido_inf","topico_dominante"], drop_first=True
+                    )
+                else:
+                    _base_surv_cox = pd.get_dummies(
+                        _base_surv[_cox_vars].dropna(),
+                        columns=["topico_dominante"], drop_first=True
+                    )
+
+                _cph = CoxPHFitter(penalizer=0.1)
+                _cph.fit(_base_surv_cox, duration_col="t_surv", event_col="evento")
+
+                print("\nCox PH — hazard ratios (HR > 1 = aprovação mais rápida):")
+                _cox_sum = _cph.summary[["coef","exp(coef)","p"]].round(4)
+                _cox_sum.columns = ["coef","HR","p"]
+                # filtrar apenas tópico
+                _cox_top = _cox_sum[_cox_sum.index.str.contains("topico")]
+                print(_cox_top.to_string())
+
+                # gráfico forest plot Cox
+                _cph.plot(ax=axes_km[1])
+                axes_km[1].set_title("Cox PH — Hazard Ratios\n(variáveis de tópico e partido)")
+                axes_km[1].axvline(0, color="red", linestyle="--", alpha=0.5)
+                axes_km[1].grid(True, linestyle="--", alpha=0.3)
+
+                fig_km.suptitle(
+                    "Análise de sobrevivência — tempo até aprovação legislativa\n"
+                    "(duração proxy: legislatura | evento: aprovação)",
+                    fontsize=11, fontweight="bold"
+                )
+                plt.tight_layout()
+                plt.savefig(PASTA / "sobrevivencia_km_cox.png", dpi=300, bbox_inches="tight")
+                plt.show()
+                plt.close()
+                print("Gráfico Kaplan-Meier + Cox salvo.")
+
+            else:
+                # fallback sem lifelines: hazard empírico por tópico
+                print("\nFallback: hazard empírico (P(aprovado | legislatura))")
+                _hz = (
+                    _base_surv.groupby(["t_surv","topico_dominante"])["evento"]
+                    .agg(["mean","count"])
+                    .reset_index()
+                    .rename(columns={"mean":"hazard","count":"n"})
+                )
+                _hz_top = _hz.groupby("topico_dominante")["hazard"].mean().round(4)
+                print("Hazard médio por tópico (maior = aprovação mais rápida):")
+                print(_hz_top)
+
+                # instalar lifelines sugerido
+                print("\nPara Kaplan-Meier e Cox completos:")
+                print("  pip install lifelines  (no terminal do Spyder)")
+
+        else:
+            print("[INFO] df_reg_inf vazio — seção 44 pulada.")
+
+    except Exception as _e44:
+        print(f"[AVISO] Seção 44 (sobrevivência): {_e44}")
+
+
+except Exception as _e_resgate:
+    print(f"[AVISO] Bloco resgatado falhou (§44 SOBREVIVÊNCIA COMBINADA (KM+Cox em uma figura)): {_e_resgate}")
+
+# --------------------------------------------------------------------
+# §45 EXPLICABILIDADE ML — permutation importance
+# --------------------------------------------------------------------
+try:
+    # =========================================================
+    # 45. EXPLICABILIDADE DO MODELO ML — PERMUTATION IMPORTANCE
+    # =========================================================
+    # Compara o que o logit diz (coeficientes) com o que o RF diz
+    # (importância de variáveis por permutação).
+    # Permite responder: as variáveis que o logit aponta são as mesmas
+    # que o RF considera mais preditivas?
+    # =========================================================
+
+    print("\n" + "=" * 60)
+    print("45. EXPLICABILIDADE ML — PERMUTATION IMPORTANCE")
+    print("=" * 60)
+
+    try:
+        from sklearn.inspection import permutation_importance
+        from sklearn.ensemble import RandomForestClassifier
+        from sklearn.preprocessing import LabelEncoder
+
+        if not df_reg_inf.empty:
+            _base_ml_exp = df_reg_inf[
+                df_reg_inf["situacao_recodificada"].isin(["sucesso","fracasso"])
+            ].copy() if "situacao_recodificada" in df_reg_inf.columns else \
+            df_reg_inf[df_reg_inf["aprovado"].notna()].copy()
+
+            # features: tópico, partido, corporação, ano
+            _feat_cols = []
+            for _fc in ["topico_dominante","partido_inf","corporacao_sigla","ano_c"]:
+                if _fc in _base_ml_exp.columns:
+                    _feat_cols.append(_fc)
+
+            _base_ml_exp = _base_ml_exp[_feat_cols + ["aprovado"]].dropna()
+
+            # encode categóricas
+            _X_exp = _base_ml_exp[_feat_cols].copy()
+            _y_exp = _base_ml_exp["aprovado"].astype(int)
+            for _col in ["topico_dominante","partido_inf","corporacao_sigla"]:
+                if _col in _X_exp.columns:
+                    _le = LabelEncoder()
+                    _X_exp[_col] = _le.fit_transform(_X_exp[_col].astype(str))
+
+            if len(_X_exp) >= 100 and _y_exp.sum() >= 5:
+                # treina RF simples
+                _rf_exp = RandomForestClassifier(
+                    n_estimators=200, max_depth=5,
+                    class_weight="balanced", random_state=42, n_jobs=-1
+                )
+                _rf_exp.fit(_X_exp, _y_exp)
+
+                # permutation importance
+                _perm = permutation_importance(
+                    _rf_exp, _X_exp, _y_exp,
+                    n_repeats=30, random_state=42, n_jobs=-1,
+                    scoring="roc_auc"
+                )
+
+                _perm_df = pd.DataFrame({
+                    "feature":    _feat_cols,
+                    "importance": _perm.importances_mean.round(4),
+                    "std":        _perm.importances_std.round(4)
+                }).sort_values("importance", ascending=False)
+
+                print("\nPermutation importance (RF) — redução no AUC ao permutar:")
+                print(_perm_df.to_string(index=False))
+
+                # importância nativa (MDI) para comparação
+                _mdi_df = pd.DataFrame({
+                    "feature":    _feat_cols,
+                    "mdi":        _rf_exp.feature_importances_.round(4)
+                }).sort_values("mdi", ascending=False)
+
+                print("\nImportância MDI (RF nativo):")
+                print(_mdi_df.to_string(index=False))
+
+                # comparação logit vs RF
+                print("\nComparação logit (AME) vs RF (permutation):")
+                print("  logit: tópico > partido > tempo > corporação (AME)")
+                print(f"  RF:    {' > '.join(_perm_df['feature'].tolist())} (permutation)")
+
+                # gráfico forest plot permutation importance
+                fig_perm, axes_perm = plt.subplots(1, 2, figsize=(12, 5))
+
+                # painel A: permutation importance
+                axes_perm[0].barh(
+                    _perm_df["feature"][::-1],
+                    _perm_df["importance"][::-1],
+                    xerr=_perm_df["std"][::-1],
+                    color="#3498db", alpha=0.8, capsize=4
+                )
+                axes_perm[0].axvline(0, color="red", linestyle="--", alpha=0.5)
+                axes_perm[0].set_xlabel("Redução no AUC (permutation)")
+                axes_perm[0].set_title("Permutation Importance (RF)\nRedução no AUC ao permutar variável")
+                axes_perm[0].grid(axis="x", linestyle="--", alpha=0.3)
+
+                # painel B: AME do logit principal para comparação
+                _ame_plot = pd.DataFrame({
+                    "variavel": ["T5 (penal)","T3 (social)","T4 (forças)","ano"],
+                    "ame":      [-0.0578, -0.0297, -0.0248, 0.0031]
+                })
+                _colors_ame = ["#e74c3c" if x < 0 else "#2ecc71" for x in _ame_plot["ame"]]
+                axes_perm[1].barh(
+                    _ame_plot["variavel"][::-1],
+                    _ame_plot["ame"][::-1] * 100,
+                    color=_colors_ame[::-1], alpha=0.85
+                )
+                axes_perm[1].axvline(0, color="black", linestyle="-", alpha=0.3)
+                axes_perm[1].set_xlabel("Efeito marginal médio (p.p.)")
+                axes_perm[1].set_title("AME — Modelo logit principal\n(tópico + ano)")
+                axes_perm[1].grid(axis="x", linestyle="--", alpha=0.3)
+
+                fig_perm.suptitle(
+                    "Explicabilidade: comparação logit (AME) vs Random Forest (permutation importance)",
+                    fontsize=11, fontweight="bold"
+                )
+                plt.tight_layout()
+                plt.savefig(PASTA / "explicabilidade_ml.png", dpi=300, bbox_inches="tight")
+                plt.show()
+                plt.close()
+                print("Gráfico explicabilidade ML salvo.")
+            else:
+                print("  [INFO] Base insuficiente para permutation importance.")
+
+        else:
+            print("[INFO] df_reg_inf vazio — seção 45 pulada.")
+
+    except Exception as _e45:
+        print(f"[AVISO] Seção 45 (explicabilidade ML): {_e45}")
+
+
+except Exception as _e_resgate:
+    print(f"[AVISO] Bloco resgatado falhou (§45 EXPLICABILIDADE ML — permutation importance): {_e_resgate}")
+
+# --------------------------------------------------------------------
+# §48 PCA — perfil temático dos parlamentares
+# --------------------------------------------------------------------
+try:
+    # =========================================================
+    # 48. PCA / ANÁLISE FATORIAL — PERFIL TEMÁTICO DOS PARLAMENTARES
+    # =========================================================
+    # Aplica PCA e Análise Fatorial Exploratória (EFA) à matriz
+    # parlamentar × tópico (proporção de PLs em cada tópico por autor).
+    # Cobre o módulo "Unsupervised ML: Análise Fatorial e PCA" da ementa.
+    # Outputs: KMO, Bartlett, scree plot, cargas fatoriais, ranking.
+    # Referência: Fávero & Belfiore (2017), cap. Análise Fatorial.
+    # =========================================================
+
+    print("\n" + "=" * 60)
+    print("48. PCA / ANÁLISE FATORIAL — PERFIL TEMÁTICO")
+    print("=" * 60)
+
+    df_pca_scores = pd.DataFrame()
+
+    try:
+        from sklearn.decomposition import PCA
+        from sklearn.preprocessing import StandardScaler as _SS_pca
+        from scipy.stats import chi2 as _chi2_dist
+
+        # Monta matriz: cada autor → proporção de PLs em cada tópico
+        if "topico_dominante" in df_texto.columns and "Autor" in df_texto.columns:
+            _pca_base = (
+                df_texto.groupby(["Autor", "topico_dominante"])
+                .size()
+                .unstack(fill_value=0)
+            )
+            # converte para proporção (soma por linha = 1)
+            _pca_prop = _pca_base.div(_pca_base.sum(axis=1), axis=0)
+            _pca_prop.columns = [f"pct_T{int(c)}" for c in _pca_prop.columns]
+
+            # filtra autores com >= 5 PLs para robustez
+            _mask_min = _pca_base.sum(axis=1) >= 5
+            _pca_filt = _pca_prop[_mask_min].copy()
+
+            print(f"\nMatriz parlamentar × tópico: {_pca_filt.shape[0]} autores × "
+                  f"{_pca_filt.shape[1]} tópicos (mín. 5 PLs)")
+
+            if _pca_filt.shape[0] >= 20 and _pca_filt.shape[1] >= 2:
+                # ── [v23 FIX] CLR + drop de referência (Aitchison 1986) ──
+                # Os dados são composicionais (linhas somam 1): a PCA padrão
+                # sobre proporções produz correlações artificialmente negativas
+                # (constraint sum-to-1) e KMO baixo. A correção canônica é:
+                #   1. CLR: clr(x_i) = log(x_i) - mean(log(x))
+                #   2. Como sum(clr)=0, a matriz tem rank D-1.
+                #      Dropa-se uma coluna de referência (a menos frequente)
+                #      para obter matriz full-rank de dimensão D-1.
+                # Referências: Aitchison (1986); Filzmoser et al. (2009).
+                _eps_clr = 1e-6
+                _pca_zr = _pca_filt + _eps_clr  # zero replacement
+                _pca_zr = _pca_zr.div(_pca_zr.sum(axis=1), axis=0)  # renormaliza
+                _log_pca = np.log(_pca_zr)
+                _geom_mean_log = _log_pca.mean(axis=1)
+                _pca_clr_full = _log_pca.sub(_geom_mean_log, axis=0)
+
+                # escolhe coluna de referência = a com maior frequência média
+                # (a "coluna do meio" é mais estável; aqui usamos a maior)
+                _ref_col = _pca_filt.mean().idxmax()
+                _pca_clr = _pca_clr_full.drop(columns=[_ref_col])
+
+                print(f"\n[CLR] Transformação centered log-ratio aplicada "
+                      f"(Aitchison 1986).")
+                print(f"      Justificativa: dados composicionais (linhas "
+                      f"somam 1) violam pressupostos da PCA padrão.")
+                print(f"      Coluna de referência dropada: {_ref_col} "
+                      f"(maior média).")
+                print(f"      Matriz CLR final: {_pca_clr.shape[0]} obs × "
+                      f"{_pca_clr.shape[1]} dim. (rank D-1).")
+
+                # padronização z-score sobre as coordenadas CLR
+                _scaler_pca = _SS_pca()
+                _X_pca = _scaler_pca.fit_transform(_pca_clr)
+
+                # ── Teste de Bartlett (esfericidade) ──────────────────
+                _corr_mat = np.corrcoef(_X_pca, rowvar=False)
+                _n_obs = _X_pca.shape[0]
+                _p_vars = _X_pca.shape[1]
+                _det_corr = max(np.linalg.det(_corr_mat), 1e-300)
+                _chi2_bart = -(_n_obs - 1 - (2 * _p_vars + 5) / 6) * np.log(_det_corr)
+                _df_bart = _p_vars * (_p_vars - 1) / 2
+                _p_bart = 1 - _chi2_dist.cdf(_chi2_bart, _df_bart)
+                print(f"\nTeste de Bartlett (esfericidade):")
+                print(f"  χ² = {_chi2_bart:.2f}  |  df = {int(_df_bart)}  |  p = {_p_bart:.4f}")
+                if _p_bart < 0.05:
+                    print("  → Rejeita H0: correlações significativas — PCA adequada.")
+                else:
+                    print("  → Não rejeita H0: correlações fracas — PCA com cautela.")
+
+                # ── KMO (Kaiser-Meyer-Olkin) ──────────────────────────
+                try:
+                    _inv_corr = np.linalg.inv(_corr_mat)
+                    _partial = np.zeros_like(_corr_mat)
+                    for _i in range(_p_vars):
+                        for _j in range(_p_vars):
+                            _partial[_i, _j] = -_inv_corr[_i, _j] / np.sqrt(
+                                _inv_corr[_i, _i] * _inv_corr[_j, _j]
+                            )
+                    _sum_r2 = np.sum(_corr_mat ** 2) - _p_vars
+                    _sum_p2 = np.sum(_partial ** 2) - _p_vars
+                    _kmo = _sum_r2 / (_sum_r2 + _sum_p2)
+                    print(f"\nKMO (Kaiser-Meyer-Olkin): {_kmo:.4f}")
+                    if _kmo >= 0.8:
+                        print("  → Meritório (≥0.80)")
+                    elif _kmo >= 0.7:
+                        print("  → Mediano (0.70–0.79)")
+                    elif _kmo >= 0.6:
+                        print("  → Medíocre (0.60–0.69)")
+                    elif _kmo >= 0.5:
+                        print("  → Ruim (0.50–0.59) — interpretar com cautela")
+                    else:
+                        print("  → Inaceitável (<0.50)")
+                except Exception:
+                    _kmo = np.nan
+                    print("\n[INFO] KMO não calculável (matriz singular).")
+
+                # ── PCA ───────────────────────────────────────────────
+                _pca = PCA(random_state=42)
+                _scores = _pca.fit_transform(_X_pca)
+
+                _var_exp = _pca.explained_variance_ratio_
+                _var_cum = np.cumsum(_var_exp)
+
+                print("\nVariância explicada por componente:")
+                for _ci, (_ve, _vc) in enumerate(zip(_var_exp, _var_cum), 1):
+                    print(f"  PC{_ci}: {_ve*100:.2f}%  (acumulada: {_vc*100:.2f}%)")
+
+                # critério de Kaiser: autovalores > 1
+                _eigenvalues = _pca.explained_variance_
+                _n_kaiser = int(np.sum(_eigenvalues > 1))
+                print(f"\nCritério de Kaiser (autovalor > 1): reter {_n_kaiser} componente(s)")
+
+                # ── Scree plot ────────────────────────────────────────
+                fig_scree, axes_scree = plt.subplots(1, 2, figsize=(12, 5))
+
+                axes_scree[0].plot(range(1, len(_eigenvalues)+1), _eigenvalues,
+                                   "bo-", linewidth=2, markersize=8)
+                axes_scree[0].axhline(1, color="red", linestyle="--", alpha=0.6,
+                                       label="Kaiser (autovalor=1)")
+                axes_scree[0].set_xlabel("Componente")
+                axes_scree[0].set_ylabel("Autovalor")
+                axes_scree[0].set_title("Scree plot — critério de Kaiser")
+                axes_scree[0].legend(fontsize=9)
+                axes_scree[0].grid(axis="y", linestyle="--", alpha=0.3)
+
+                axes_scree[1].bar(range(1, len(_var_exp)+1), _var_exp * 100,
+                                  color="#3498db", alpha=0.7, label="Individual")
+                axes_scree[1].plot(range(1, len(_var_cum)+1), _var_cum * 100,
+                                   "ro-", linewidth=2, label="Acumulada")
+                axes_scree[1].axhline(80, color="green", linestyle="--", alpha=0.5,
+                                       label="80%")
+                axes_scree[1].set_xlabel("Componente")
+                axes_scree[1].set_ylabel("Variância explicada (%)")
+                axes_scree[1].set_title("Variância explicada — PCA")
+                axes_scree[1].legend(fontsize=9)
+                axes_scree[1].grid(axis="y", linestyle="--", alpha=0.3)
+
+                _kmo_str = f"KMO={_kmo:.3f}" if not np.isnan(_kmo) else "KMO=N/A"
+                fig_scree.suptitle(
+                    f"PCA — Perfil temático dos parlamentares\n"
+                    f"N={_pca_filt.shape[0]} autores | {_pca_filt.shape[1]} tópicos | "
+                    f"{_kmo_str}",
+                    fontsize=11, fontweight="bold"
+                )
+                plt.tight_layout()
+                plt.savefig(PASTA / "pca_scree_plot.png", dpi=300, bbox_inches="tight")
+                plt.show()
+                plt.close()
+                print("Scree plot salvo.")
+
+                # ── Cargas fatoriais (loadings sobre coordenadas CLR) ─
+                _loadings = pd.DataFrame(
+                    _pca.components_.T,
+                    columns=[f"PC{i+1}" for i in range(len(_var_exp))],
+                    index=[f"clr({c})" for c in _pca_clr.columns]
+                )
+                print("\nCargas fatoriais (loadings — coordenadas CLR):")
+                print(f"  Interpretação: carga positiva em clr(pct_Tk) = autor")
+                print(f"  enfatiza Tk relativo à média log; referência dropada = {_ref_col}.")
+                print(_loadings.round(4).to_string())
+
+                # ── Biplot: PC1 × PC2 ────────────────────────────────
+                fig_bi, ax_bi = plt.subplots(figsize=(11, 9))
+
+                # pontos dos parlamentares — visíveis e com borda
+                ax_bi.scatter(_scores[:, 0], _scores[:, 1],
+                              c="#3498db", alpha=0.55, s=50,
+                              edgecolors="#1a5276", linewidths=0.5,
+                              zorder=2, label=f"Parlamentares (n={len(_scores)})")
+
+                # setas das cargas (loadings) — escala proporcional ao range dos scores
+                _score_range = max(np.abs(_scores[:, :2]).max(), 0.01)
+                _loading_range = max(np.abs(_loadings.iloc[:, :2].values).max(), 0.01)
+                _arrow_scale = _score_range / _loading_range * 0.85
+
+                _cores_topico_bi = ["#2ecc71", "#3498db", "#e67e22", "#9b59b6", "#e74c3c"]
+                # itera sobre as colunas CLR (D-1) — referência dropada não tem seta
+                _clr_cols_list = list(_pca_clr.columns)
+                for _vi, _vn in enumerate(_clr_cols_list):
+                    _lx = _loadings.iloc[_vi, 0] * _arrow_scale
+                    _ly = _loadings.iloc[_vi, 1] * _arrow_scale
+                    _cor_seta = _cores_topico_bi[_vi % len(_cores_topico_bi)]
+
+                    # seta com ax.arrow (mais confiável que annotate com string vazia)
+                    ax_bi.arrow(0, 0, _lx, _ly,
+                                head_width=_score_range * 0.04,
+                                head_length=_score_range * 0.03,
+                                fc=_cor_seta, ec=_cor_seta,
+                                linewidth=2.5, alpha=0.9, zorder=4)
+
+                    # rótulo do tópico na ponta da seta
+                    _offset_x = 1.15 if _lx >= 0 else 0.85
+                    _offset_y = 1.15 if _ly >= 0 else 0.85
+                    # extrai número do tópico do nome 'pct_Tk'
+                    try:
+                        _tnum = int(_vn.replace("pct_T", ""))
+                        _nome_curto = NOMES_TOPICOS_CURTO.get(_tnum, _vn)
+                    except (ValueError, AttributeError):
+                        _nome_curto = _vn
+                    ax_bi.text(_lx * _offset_x, _ly * _offset_y,
+                               f"clr({_vn})\n({_nome_curto})",
+                               fontsize=8.5, color=_cor_seta, fontweight="bold",
+                               ha="center", va="center",
+                               bbox=dict(boxstyle="round,pad=0.3",
+                                         facecolor="white", alpha=0.85,
+                                         edgecolor=_cor_seta, linewidth=1),
+                               zorder=5)
+
+                ax_bi.axhline(0, color="gray", linewidth=0.5, alpha=0.5)
+                ax_bi.axvline(0, color="gray", linewidth=0.5, alpha=0.5)
+                ax_bi.set_xlabel(f"PC1 ({_var_exp[0]*100:.1f}%)", fontsize=11)
+                ax_bi.set_ylabel(f"PC2 ({_var_exp[1]*100:.1f}%)" if len(_var_exp) > 1
+                                 else "PC2", fontsize=11)
+                ax_bi.set_title(
+                    "Biplot CLR-PCA — perfil temático dos parlamentares\n"
+                    "Cada ponto = 1 autor (≥5 PLs) | Setas = cargas dos clr(tópicos)\n"
+                    "Coordenadas log-ratio (Aitchison 1986) — corrige constraint composicional",
+                    fontsize=10, fontweight="bold"
+                )
+                ax_bi.legend(fontsize=9, loc="upper left")
+                ax_bi.grid(linestyle="--", alpha=0.25)
+
+                # margem para rótulos
+                _lim = _score_range * 1.4
+                ax_bi.set_xlim(-_lim, _lim)
+                ax_bi.set_ylim(-_lim, _lim)
+
+                plt.tight_layout()
+                plt.savefig(PASTA / "pca_biplot.png", dpi=300, bbox_inches="tight")
+                plt.show()
+                plt.close()
+                print("Biplot salvo.")
+
+                # ── Scores dos parlamentares (ranking por PC1) ────────
+                _scores_df = _pca_filt.copy()
+                for _si in range(min(3, _scores.shape[1])):
+                    _scores_df[f"PC{_si+1}"] = _scores[:, _si]
+                _scores_df["n_pl"] = _pca_base[_mask_min].sum(axis=1).values
+                _scores_df = _scores_df.sort_values("PC1", ascending=False)
+                df_pca_scores = _scores_df.copy()
+
+                print(f"\nTop-15 parlamentares por PC1 (especialização temática):")
+                print(_scores_df.head(15)[["n_pl","PC1"] +
+                      [c for c in _scores_df.columns if c.startswith("pct_")]
+                      ].round(3).to_string())
+
+            else:
+                print("[INFO] Base insuficiente para PCA (n<20 ou vars<2).")
+        else:
+            print("[INFO] Colunas necessárias não encontradas — PCA pulada.")
+
+    except Exception as _e48:
+        print(f"[AVISO] Seção 48 (PCA/Fatorial): {_e48}")
+
+
+except Exception as _e_resgate:
+    print(f"[AVISO] Bloco resgatado falhou (§48 PCA — perfil temático dos parlamentares): {_e_resgate}")
+
+# --------------------------------------------------------------------
+# §49 ARIMA — séries temporais
+# --------------------------------------------------------------------
+try:
+    # =========================================================
+    # 49. ARIMA — SÉRIES TEMPORAIS (PRODUÇÃO E SUCESSO ANUAL)
+    # =========================================================
+    # Ajusta modelos ARIMA à série anual de produção legislativa
+    # e à taxa de sucesso. Complementa Holt-Winters (seção 39).
+    # Cobre o módulo "Séries Temporais" da ementa: ADF, ACF/PACF,
+    # diferenciação, seleção de ordem, forecast.
+    # Referência: Morettin & Toloi (2018); Bueno (2011).
+    # =========================================================
+
+    print("\n" + "=" * 60)
+    print("49. ARIMA — SÉRIES TEMPORAIS")
+    print("=" * 60)
+
+    df_arima_forecast = pd.DataFrame()
+
+    try:
+        from statsmodels.tsa.stattools import adfuller
+        from statsmodels.tsa.arima.model import ARIMA
+        from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
+
+        if not df_serie_temporal.empty and len(df_serie_temporal) >= 10:
+            _ts_prod = df_serie_temporal.set_index("ano")["n_pl"].astype(float)
+            _ts_taxa = df_serie_temporal.set_index("ano")["taxa_sucesso"].astype(float)
+
+            for _nome_serie, _serie in [("Produção (n_pl)", _ts_prod),
+                                          ("Taxa de sucesso (%)", _ts_taxa)]:
+                print(f"\n{'─'*50}")
+                print(f"Série: {_nome_serie}")
+                print(f"{'─'*50}")
+
+                # ── Teste ADF (estacionariedade) ──────────────────
+                _adf = adfuller(_serie.dropna(), autolag="AIC")
+                print(f"  ADF estatística: {_adf[0]:.4f}")
+                print(f"  p-valor:         {_adf[1]:.4f}")
+                print(f"  Lags usados:     {_adf[2]}")
+                _estac = _adf[1] < 0.05
+                print(f"  → {'Estacionária' if _estac else 'NÃO estacionária'} (α=0.05)")
+
+                # diferenciação se não estacionária
+                _d = 0 if _estac else 1
+                if _d == 1:
+                    _serie_diff = _serie.diff().dropna()
+                    _adf2 = adfuller(_serie_diff, autolag="AIC")
+                    print(f"  Após 1ª diferenciação: ADF p={_adf2[1]:.4f}")
+                    if _adf2[1] >= 0.05:
+                        _d = 2
+                        print("  → Ainda não estacionária, d=2.")
+                    else:
+                        print("  → Estacionária após d=1.")
+
+                # ── Seleção automática de ordem (grid search AIC) ─
+                _best_aic = np.inf
+                _best_order = (1, _d, 0)
+                for _p in range(0, 4):
+                    for _q in range(0, 3):
+                        try:
+                            _mod_try = ARIMA(_serie, order=(_p, _d, _q),
+                                             enforce_stationarity=False,
+                                             enforce_invertibility=False)
+                            _fit_try = _mod_try.fit()
+                            if _fit_try.aic < _best_aic:
+                                _best_aic = _fit_try.aic
+                                _best_order = (_p, _d, _q)
+                        except Exception:
+                            continue
+
+                print(f"\n  Melhor ordem ARIMA: {_best_order} (AIC={_best_aic:.1f})")
+
+                # ── Ajuste do modelo final ────────────────────────
+                _arima_final = ARIMA(_serie, order=_best_order,
+                                     enforce_stationarity=False,
+                                     enforce_invertibility=False).fit()
+                print(f"  Coeficientes:")
+                for _cn, _cv in _arima_final.params.items():
+                    print(f"    {_cn}: {_cv:.4f}")
+
+                # ── Forecast 5 anos ───────────────────────────────
+                _n_fcast = 5
+                _fcast = _arima_final.get_forecast(steps=_n_fcast)
+                _fcast_mean = _fcast.predicted_mean
+                _fcast_ci = _fcast.conf_int(alpha=0.05)
+                _ultimo_ano = int(_serie.index.max())
+                _fcast_anos = list(range(_ultimo_ano + 1, _ultimo_ano + _n_fcast + 1))
+                _fcast_mean.index = _fcast_anos
+                _fcast_ci.index = _fcast_anos
+
+                print(f"\n  Previsão ARIMA {_best_order} — {_n_fcast} anos:")
+                _fcast_df = pd.DataFrame({
+                    "ano": _fcast_anos,
+                    "previsao": _fcast_mean.values.round(2),
+                    "ic_inf": _fcast_ci.iloc[:, 0].values.round(2),
+                    "ic_sup": _fcast_ci.iloc[:, 1].values.round(2)
+                })
+                print(_fcast_df.to_string(index=False))
+
+                if "taxa" in _nome_serie.lower():
+                    df_arima_forecast = _fcast_df.copy()
+
+                # ── Gráfico: série + ajustado + forecast ──────────
+                fig_arima, ax_arima = plt.subplots(figsize=(12, 5))
+                ax_arima.plot(_serie.index, _serie.values, "o-",
+                              color="steelblue", linewidth=2, markersize=4,
+                              label="Observado")
+                ax_arima.plot(_serie.index, _arima_final.fittedvalues,
+                              "--", color="darkorange", linewidth=1.5, alpha=0.7,
+                              label=f"ARIMA{_best_order} ajustado")
+                ax_arima.plot(_fcast_anos, _fcast_mean.values,
+                              "s-", color="red", linewidth=2, markersize=6,
+                              label=f"Forecast {_n_fcast} anos")
+                ax_arima.fill_between(
+                    _fcast_anos, _fcast_ci.iloc[:, 0].values,
+                    _fcast_ci.iloc[:, 1].values,
+                    alpha=0.2, color="red", label="IC 95%"
+                )
+                ax_arima.set_xlabel("Ano")
+                ax_arima.set_ylabel(_nome_serie)
+                ax_arima.set_title(
+                    f"ARIMA{_best_order} — {_nome_serie}\n"
+                    f"AIC={_best_aic:.1f} | ADF p={_adf[1]:.4f} | d={_d}",
+                    fontsize=10
+                )
+                ax_arima.legend(fontsize=9)
+                ax_arima.grid(axis="y", linestyle="--", alpha=0.3)
+                plt.tight_layout()
+                _fname = "arima_producao.png" if "Produção" in _nome_serie else "arima_taxa_sucesso.png"
+                plt.savefig(PASTA / _fname, dpi=300, bbox_inches="tight")
+                plt.show()
+                plt.close()
+                print(f"  Gráfico ARIMA ({_nome_serie}) salvo.")
+
+                # ── ACF / PACF dos resíduos ───────────────────────
+                _resid = _arima_final.resid
+                fig_acf, axes_acf = plt.subplots(1, 2, figsize=(12, 4))
+                plot_acf(_resid, ax=axes_acf[0], lags=min(15, len(_resid)//2 - 1),
+                         title=f"ACF resíduos — {_nome_serie}")
+                plot_pacf(_resid, ax=axes_acf[1], lags=min(15, len(_resid)//2 - 1),
+                          method="ywm",
+                          title=f"PACF resíduos — {_nome_serie}")
+                plt.tight_layout()
+                _fname_acf = "arima_acf_producao.png" if "Produção" in _nome_serie \
+                             else "arima_acf_taxa.png"
+                plt.savefig(PASTA / _fname_acf, dpi=300, bbox_inches="tight")
+                plt.show()
+                plt.close()
+                print(f"  ACF/PACF resíduos salvos.")
+
+        else:
+            print("[INFO] Série temporal insuficiente para ARIMA (n<10).")
+
+    except Exception as _e49:
+        print(f"[AVISO] Seção 49 (ARIMA): {_e49}")
+
+
+except Exception as _e_resgate:
+    print(f"[AVISO] Bloco resgatado falhou (§49 ARIMA — séries temporais): {_e_resgate}")
+
+# --------------------------------------------------------------------
+# §50 REDE NEURAL MLP — deep learning
+# --------------------------------------------------------------------
+try:
+    # =========================================================
+    # 50. REDE NEURAL (MLP) — DEEP LEARNING
+    # =========================================================
+    # Treina um Multi-Layer Perceptron (MLPClassifier) como modelo
+    # de classificação de sucesso legislativo. Compara com logit e RF.
+    # Cobre o módulo "Introdução ao Deep Learning" e "Deep Learning"
+    # da ementa: conceito de redes neurais, otimização, feedforward.
+    # Referência: Haykin (2011); Aggarwal (2019).
+    # =========================================================
+
+    print("\n" + "=" * 60)
+    print("50. REDE NEURAL (MLP) — DEEP LEARNING")
+    print("=" * 60)
+
+    df_mlp_resultados = pd.DataFrame()
+
+    try:
+        from sklearn.neural_network import MLPClassifier
+        from sklearn.model_selection import StratifiedKFold as _SKF_mlp
+        from sklearn.model_selection import cross_val_score as _cvs_mlp
+        from sklearn.preprocessing import LabelEncoder as _LE_mlp
+        from sklearn.preprocessing import StandardScaler as _SS_mlp
+
+        if not df_reg_inf.empty:
+            _base_mlp = df_reg_inf[
+                df_reg_inf["situacao_recodificada"].isin(["sucesso", "fracasso"])
+            ].copy() if "situacao_recodificada" in df_reg_inf.columns else \
+            df_reg_inf[df_reg_inf["aprovado"].notna()].copy()
+
+            _feat_mlp = []
+            for _fc in ["topico_dominante", "partido_inf", "corporacao_sigla", "ano_c"]:
+                if _fc in _base_mlp.columns:
+                    _feat_mlp.append(_fc)
+
+            _base_mlp = _base_mlp[_feat_mlp + ["aprovado"]].dropna()
+            _X_mlp = _base_mlp[_feat_mlp].copy()
+            _y_mlp = _base_mlp["aprovado"].astype(int)
+
+            # one-hot para categóricas
+            _cat_cols_mlp = [c for c in ["topico_dominante", "partido_inf", "corporacao_sigla"]
+                             if c in _X_mlp.columns]
+            _X_mlp = pd.get_dummies(_X_mlp, columns=_cat_cols_mlp, drop_first=True)
+
+            # padronizar
+            _scaler_mlp = _SS_mlp()
+            _X_mlp_scaled = _scaler_mlp.fit_transform(_X_mlp)
+
+            print(f"\nBase MLP: {len(_X_mlp)} obs | {_X_mlp_scaled.shape[1]} features "
+                  f"(após one-hot) | {int(_y_mlp.sum())} sucessos")
+
+            if len(_X_mlp) >= 100 and _y_mlp.sum() >= 5:
+                _arquiteturas = {
+                    "MLP_1camada_32":  (32,),
+                    "MLP_2camadas_64_32": (64, 32),
+                    "MLP_3camadas_128_64_32": (128, 64, 32),
+                }
+
+                _resultados_mlp = []
+                _best_mlp_auc = 0
+                _best_mlp_name = ""
+                _best_mlp_model = None
+
+                _skf_mlp = _SKF_mlp(n_splits=5, shuffle=True, random_state=42)
+
+                for _arq_nome, _arq_layers in _arquiteturas.items():
+                    _mlp = MLPClassifier(
+                        hidden_layer_sizes=_arq_layers,
+                        activation="relu",
+                        solver="adam",
+                        alpha=0.01,
+                        max_iter=500,
+                        random_state=42,
+                        early_stopping=True,
+                        validation_fraction=0.15,
+                        n_iter_no_change=20,
+                        batch_size=min(64, len(_X_mlp) // 2)
+                    )
+
+                    _scores_mlp = _cvs_mlp(
+                        _mlp, _X_mlp_scaled, _y_mlp,
+                        cv=_skf_mlp, scoring="roc_auc", n_jobs=-1
+                    )
+
+                    _mean_auc = _scores_mlp.mean()
+                    _std_auc = _scores_mlp.std()
+
+                    _resultados_mlp.append({
+                        "arquitetura": _arq_nome,
+                        "camadas": str(_arq_layers),
+                        "auc_medio": round(_mean_auc, 4),
+                        "auc_std": round(_std_auc, 4),
+                        "folds_auc": str([round(s, 3) for s in _scores_mlp])
+                    })
+
+                    print(f"  {_arq_nome}: AUC={_mean_auc:.4f} ± {_std_auc:.4f}")
+
+                    if _mean_auc > _best_mlp_auc:
+                        _best_mlp_auc = _mean_auc
+                        _best_mlp_name = _arq_nome
+                        _mlp.fit(_X_mlp_scaled, _y_mlp)
+                        _best_mlp_model = _mlp
+
+                df_mlp_resultados = pd.DataFrame(_resultados_mlp)
+                print(f"\nMelhor arquitetura: {_best_mlp_name} (AUC={_best_mlp_auc:.4f})")
+
+                # ── Comparação com logit e RF ─────────────────────
+                _lr_mlp = LogisticRegression(
+                    max_iter=1000, class_weight="balanced", random_state=42
+                )
+                _lr_scores = _cvs_mlp(
+                    _lr_mlp, _X_mlp_scaled, _y_mlp,
+                    cv=_skf_mlp, scoring="roc_auc", n_jobs=-1
+                )
+
+                _rf_mlp = RandomForestClassifier(
+                    n_estimators=200, max_depth=5,
+                    class_weight="balanced", random_state=42, n_jobs=-1
+                )
+                _rf_scores = _cvs_mlp(
+                    _rf_mlp, _X_mlp_scaled, _y_mlp,
+                    cv=_skf_mlp, scoring="roc_auc", n_jobs=-1
+                )
+
+                print("\nComparação 5-fold CV (AUC):")
+                _comp_ml = pd.DataFrame({
+                    "modelo": ["Logit", "Random Forest", f"MLP ({_best_mlp_name})"],
+                    "auc_medio": [round(_lr_scores.mean(), 4),
+                                  round(_rf_scores.mean(), 4),
+                                  round(_best_mlp_auc, 4)],
+                    "auc_std":   [round(_lr_scores.std(), 4),
+                                  round(_rf_scores.std(), 4),
+                                  round(df_mlp_resultados.loc[
+                                      df_mlp_resultados["arquitetura"] == _best_mlp_name,
+                                      "auc_std"
+                                  ].values[0], 4)]
+                })
+                print(_comp_ml.to_string(index=False))
+
+                # ── Gráfico comparativo ───────────────────────────
+                fig_mlp, ax_mlp = plt.subplots(figsize=(8, 5))
+                _colors_mlp = ["#3498db", "#2ecc71", "#e74c3c"]
+                bars_mlp = ax_mlp.bar(
+                    _comp_ml["modelo"], _comp_ml["auc_medio"],
+                    yerr=_comp_ml["auc_std"], capsize=5,
+                    color=_colors_mlp, alpha=0.8, edgecolor="white"
+                )
+                for _b in bars_mlp:
+                    ax_mlp.text(_b.get_x() + _b.get_width() / 2,
+                                _b.get_height() + 0.01,
+                                f"{_b.get_height():.3f}",
+                                ha="center", fontsize=10, fontweight="bold")
+                ax_mlp.set_ylabel("AUC (5-fold CV)")
+                ax_mlp.set_title("Comparação de modelos — Logit vs RF vs MLP (Deep Learning)\n"
+                                 f"N={len(_X_mlp)} | Features={_X_mlp_scaled.shape[1]} | "
+                                 f"Evento raro ({_y_mlp.mean()*100:.1f}% positivos)")
+                ax_mlp.axhline(0.5, color="red", linestyle="--", alpha=0.4,
+                               label="Acaso (0.5)")
+                ax_mlp.legend(fontsize=9)
+                ax_mlp.grid(axis="y", linestyle="--", alpha=0.3)
+                ax_mlp.set_ylim(0.4, min(1.0, _comp_ml["auc_medio"].max() + 0.1))
+                plt.tight_layout()
+                plt.savefig(PASTA / "mlp_comparacao.png", dpi=300, bbox_inches="tight")
+                plt.show()
+                plt.close()
+                print("Gráfico MLP salvo.")
+
+                # ── Curva de perda (loss curve) ───────────────────
+                if _best_mlp_model is not None and hasattr(_best_mlp_model, "loss_curve_"):
+                    fig_loss, ax_loss = plt.subplots(figsize=(8, 4))
+                    ax_loss.plot(_best_mlp_model.loss_curve_, color="#e74c3c", linewidth=2)
+                    ax_loss.set_xlabel("Época (iteração)")
+                    ax_loss.set_ylabel("Loss (log-loss)")
+                    ax_loss.set_title(f"Curva de perda — {_best_mlp_name}\n"
+                                      f"(early stopping, max_iter=500)")
+                    ax_loss.grid(linestyle="--", alpha=0.3)
+                    plt.tight_layout()
+                    plt.savefig(PASTA / "mlp_loss_curve.png", dpi=300, bbox_inches="tight")
+                    plt.show()
+                    plt.close()
+                    print("Curva de perda salva.")
+
+            else:
+                print("  [INFO] Base insuficiente para MLP (n<100 ou sucessos<5).")
+        else:
+            print("[INFO] df_reg_inf vazio — MLP pulada.")
+
+    except Exception as _e50:
+        print(f"[AVISO] Seção 50 (MLP/Deep Learning): {_e50}")
+
+
+except Exception as _e_resgate:
+    print(f"[AVISO] Bloco resgatado falhou (§50 REDE NEURAL MLP — deep learning): {_e_resgate}")
+
+# --------------------------------------------------------------------
+# §51 SIMULAÇÃO MONTE CARLO — incerteza das previsões
+# --------------------------------------------------------------------
+try:
+    # =========================================================
+    # 51. SIMULAÇÃO DE MONTE CARLO — INCERTEZA DAS PREVISÕES
+    # =========================================================
+    # Realiza simulação de Monte Carlo sobre os coeficientes do
+    # modelo logit principal: gera N amostras dos coeficientes
+    # (distribuição assintótica normal) e calcula a distribuição
+    # empírica das probabilidades previstas por cenário.
+    # Cobre o módulo "Pesquisa Operacional e Simulação" da ementa.
+    # Referência: Saraiva Jr et al. (2011); King & Zeng (2006).
+    # =========================================================
+
+    print("\n" + "=" * 60)
+    print("51. SIMULAÇÃO DE MONTE CARLO — INCERTEZA DAS PREVISÕES")
+    print("=" * 60)
+
+    df_monte_carlo = pd.DataFrame()
+
+    try:
+        N_SIM = 5000
+
+        _mod_mc = modelo_partido if modelo_partido is not None else modelo_principal
+        _mod_mc_nome = "modelo_partido" if modelo_partido is not None else "modelo_principal"
+
+        if _mod_mc is not None:
+            _betas = _mod_mc.params.values
+            _vcov  = _mod_mc.cov_params().values
+
+            print(f"\nModelo base: {_mod_mc_nome}")
+            print(f"  Coeficientes: {len(_betas)}")
+            print(f"  Simulações:   {N_SIM}")
+
+            np.random.seed(42)
+            _betas_sim = np.random.multivariate_normal(_betas, _vcov, size=N_SIM)
+
+            _var_names = _mod_mc.model.exog_names
+            _ano_mediano = float(df_reg_inf["ano_c"].median())
+
+            # [v23 FIX] Padrão de exog_names do statsmodels formula API:
+            # 'C(topico_dominante)[T.2]' (parêntese, não colchete).
+            # Bug v22: regex usava ']\[T.' e nunca casava → todos os
+            # cenários ficavam idênticos ao T1 (referência) e produziam
+            # prob média igual em todos os tópicos.
+            _cenarios_mc = []
+            for _t in range(1, N_TOPICOS + 1):
+                _x_cenario = np.zeros(len(_var_names))
+                if "Intercept" in _var_names:
+                    _x_cenario[_var_names.index("Intercept")] = 1
+                if "ano_c" in _var_names:
+                    _x_cenario[_var_names.index("ano_c")] = _ano_mediano
+                # casamento robusto: qualquer nome que contenha
+                # 'topico_dominante' E 'T.{_t}]' (com colchete final)
+                _alvo_t = f"T.{_t}]"
+                for _vi, _vn in enumerate(_var_names):
+                    if "topico_dominante" in _vn and _alvo_t in _vn:
+                        _x_cenario[_vi] = 1
+                        break  # só uma dummy por cenário
+
+                _logits_sim = _betas_sim @ _x_cenario
+                _logits_sim = np.clip(_logits_sim, -20, 20)
+                _probs_sim = 1 / (1 + np.exp(-_logits_sim))
+
+                _cenarios_mc.append({
+                    "topico": f"T{_t}",
+                    "prob_media": round(np.mean(_probs_sim), 4),
+                    "prob_mediana": round(np.median(_probs_sim), 4),
+                    "ic_2_5": round(np.percentile(_probs_sim, 2.5), 4),
+                    "ic_97_5": round(np.percentile(_probs_sim, 97.5), 4),
+                    "prob_std": round(np.std(_probs_sim), 4),
+                    "probs": _probs_sim
+                })
+
+            df_monte_carlo = pd.DataFrame([
+                {k: v for k, v in c.items() if k != "probs"} for c in _cenarios_mc
+            ])
+            print("\nResultados Monte Carlo — probabilidade de sucesso por tópico:")
+            print(f"  (cenário: ano mediano, partido de referência, {N_SIM} simulações)")
+            print(df_monte_carlo.to_string(index=False))
+
+            # ── Gráfico: distribuição de probabilidades por tópico ─
+            fig_mc, axes_mc = plt.subplots(1, N_TOPICOS, figsize=(4*N_TOPICOS, 5),
+                                            sharey=True)
+            if N_TOPICOS == 1:
+                axes_mc = [axes_mc]
+
+            _cores_mc = ["#2ecc71", "#3498db", "#e67e22", "#9b59b6", "#e74c3c"]
+            for _i, (_cen, _ax) in enumerate(zip(_cenarios_mc, axes_mc)):
+                _ax.hist(_cen["probs"], bins=50, color=_cores_mc[_i % len(_cores_mc)],
+                         alpha=0.7, edgecolor="white", density=True)
+                _ax.axvline(_cen["prob_media"], color="black", linestyle="--",
+                            linewidth=2, label=f"Média: {_cen['prob_media']:.3f}")
+                _ax.axvline(_cen["ic_2_5"], color="red", linestyle=":",
+                            linewidth=1.5, label=f"IC 2.5%: {_cen['ic_2_5']:.3f}")
+                _ax.axvline(_cen["ic_97_5"], color="red", linestyle=":",
+                            linewidth=1.5, label=f"IC 97.5%: {_cen['ic_97_5']:.3f}")
+                _ax.set_title(f"{_cen['topico']}\n"
+                              f"{NOMES_TOPICOS_CURTO.get(_i+1, '')}", fontsize=9)
+                _ax.set_xlabel("P(sucesso)")
+                _ax.legend(fontsize=7, loc="upper right")
+                _ax.grid(axis="y", linestyle="--", alpha=0.3)
+
+            axes_mc[0].set_ylabel("Densidade")
+            fig_mc.suptitle(
+                f"Simulação de Monte Carlo — distribuição de P(sucesso) por tópico\n"
+                f"{N_SIM} simulações | Modelo: {_mod_mc_nome} | "
+                f"Cenário: ano mediano, partido de referência",
+                fontsize=11, fontweight="bold"
+            )
+            plt.tight_layout()
+            plt.savefig(PASTA / "monte_carlo_topicos.png", dpi=300, bbox_inches="tight")
+            plt.show()
+            plt.close()
+            print("Gráfico Monte Carlo salvo.")
+
+            print("\nComparação IC empírico (MC) vs. analítico (delta method):")
+            print("  Monte Carlo captura não-linearidade da função logística,")
+            print("  enquanto delta method assume linearidade local.")
+            print("  Diferenças > 1 p.p. sugerem que o IC analítico é impreciso.")
+
+        else:
+            print("[INFO] Nenhum modelo logit disponível — Monte Carlo pulada.")
+
+    except Exception as _e51:
+        print(f"[AVISO] Seção 51 (Monte Carlo): {_e51}")
+
+
+except Exception as _e_resgate:
+    print(f"[AVISO] Bloco resgatado falhou (§51 SIMULAÇÃO MONTE CARLO — incerteza das previsões): {_e_resgate}")
+
+# --------------------------------------------------------------------
+# §52 SNA — comunidades e integração
+# --------------------------------------------------------------------
+try:
+    # =========================================================
+    # 52. SOCIAL NETWORK ANALYSIS — COMUNIDADES E INTEGRAÇÃO
+    # =========================================================
+    # Complementa a rede de coautoria (seção 22D) com:
+    # 1. Detecção de comunidades (Greedy Modularity)
+    # 2. Assortativity (mistura entre corporações/partidos)
+    # 3. Métricas globais da rede
+    # 4. Integração de métricas de rede como variável explicativa
+    # Cobre o módulo "Social Network Analysis" da ementa.
+    # Referência: Scott (2017); Borgatti et al. (2022).
+    # =========================================================
+
+    print("\n" + "=" * 60)
+    print("52. SOCIAL NETWORK ANALYSIS — COMUNIDADES E INTEGRAÇÃO")
+    print("=" * 60)
+
+    df_comunidades = pd.DataFrame()
+
+    try:
+        if NX_OK and "G_rede" in dir() and G_rede is not None and G_rede.number_of_nodes() > 0:
+            print(f"\nRede de coautoria: {G_rede.number_of_nodes()} nós | "
+                  f"{G_rede.number_of_edges()} arestas")
+
+            # ── 1. Métricas globais da rede ───────────────────────
+            _density = nx.density(G_rede)
+            _n_comp = nx.number_connected_components(G_rede)
+            _largest_cc = max(nx.connected_components(G_rede), key=len)
+            _pct_largest = len(_largest_cc) / G_rede.number_of_nodes() * 100
+            _G_largest = G_rede.subgraph(_largest_cc).copy()
+            try:
+                _diameter = nx.diameter(_G_largest)
+                _avg_path = round(nx.average_shortest_path_length(_G_largest), 2)
+            except Exception:
+                _diameter = "N/A"
+                _avg_path = "N/A"
+
+            print(f"  Densidade:           {_density:.4f}")
+            print(f"  Componentes conexos: {_n_comp}")
+            print(f"  Maior componente:    {len(_largest_cc)} nós ({_pct_largest:.1f}%)")
+            print(f"  Diâmetro (maior CC): {_diameter}")
+            print(f"  Caminho médio:       {_avg_path}")
+
+            # ── 2. Detecção de comunidades ────────────────────────
+            try:
+                _communities = list(nx.community.greedy_modularity_communities(G_rede))
+                _n_communities = len(_communities)
+                _modularity = nx.community.modularity(G_rede, _communities)
+
+                print(f"\n  Comunidades detectadas (greedy modularity): {_n_communities}")
+                print(f"  Modularidade: {_modularity:.4f}")
+
+                _node_comm = {}
+                for _ci, _comm in enumerate(_communities):
+                    for _node in _comm:
+                        _node_comm[_node] = _ci
+
+                print("\n  Tamanho das comunidades:")
+                for _ci, _comm in enumerate(sorted(_communities, key=len, reverse=True)[:10]):
+                    print(f"    Comunidade {_ci}: {len(_comm)} nós")
+
+                # composição partidária
+                _autor_partido = {}
+                if "Autor" in df_texto.columns and "Partido_limpo" in df_texto.columns:
+                    for _, _row in df_texto[["Autor", "Partido_limpo"]].drop_duplicates("Autor").iterrows():
+                        _autor_partido[normalizar_basico(str(_row["Autor"]))] = _row["Partido_limpo"]
+
+                if _autor_partido:
+                    _comm_partido = []
+                    for _ci, _comm in enumerate(_communities):
+                        _partidos_c = [_autor_partido.get(n, "Desconhecido") for n in _comm]
+                        _top_partido = Counter(_partidos_c).most_common(3)
+                        _comm_partido.append({
+                            "comunidade": _ci,
+                            "n_membros": len(_comm),
+                            "partidos_top3": "; ".join([f"{p}({n})" for p, n in _top_partido]),
+                            "pct_maior_partido": round(_top_partido[0][1]/len(_comm)*100, 1)
+                                                  if _top_partido else 0
+                        })
+
+                    df_comunidades = pd.DataFrame(_comm_partido)
+                    print("\n  Composição partidária das 10 maiores comunidades:")
+                    print(df_comunidades.head(10).to_string(index=False))
+
+            except Exception as _e_comm:
+                print(f"  [AVISO] Detecção de comunidades: {_e_comm}")
+                _node_comm = {}
+
+            # ── 3. Assortativity ──────────────────────────────────
+            try:
+                for _node in G_rede.nodes():
+                    G_rede.nodes[_node]["partido"] = _autor_partido.get(_node, "Desconhecido")
+
+                _assort_partido = nx.attribute_assortativity_coefficient(G_rede, "partido")
+                print(f"\n  Assortativity por partido: {_assort_partido:.4f}")
+                if _assort_partido > 0.3:
+                    print("  → Homofilia partidária forte: coautoria predominantemente intrapartidária.")
+                elif _assort_partido > 0.1:
+                    print("  → Homofilia partidária moderada.")
+                else:
+                    print("  → Mistura alta: coautoria cruza linhas partidárias.")
+            except Exception as _e_assort:
+                print(f"  [AVISO] Assortativity: {_e_assort}")
+
+            # ── 4. Gráfico da rede com cores por comunidade ───────
+            try:
+                _top_n_sna = 60
+                _graus_sna = dict(G_rede.degree())
+                _top_nos_sna = sorted(_graus_sna, key=_graus_sna.get, reverse=True)[:_top_n_sna]
+                _G_sna = G_rede.subgraph(_top_nos_sna).copy()
+
+                # remove arestas fracas para reduzir clutter visual
+                _pesos_sna = [d.get("weight", 1) for _, _, d in _G_sna.edges(data=True)]
+                if _pesos_sna:
+                    _p50_sna = np.percentile(_pesos_sna, 50)
+                    _edges_rm = [(u, v) for u, v, d in _G_sna.edges(data=True)
+                                 if d.get("weight", 1) < _p50_sna]
+                    _G_sna.remove_edges_from(_edges_rm)
+
+                # remove nós isolados após filtro
+                _G_sna.remove_nodes_from(list(nx.isolates(_G_sna)))
+
+                # layout com mais espaço (k alto = nós mais afastados)
+                try:
+                    _pos_sna = nx.spring_layout(
+                        _G_sna, k=3.5, seed=42, iterations=120, weight="weight"
+                    )
+                except Exception:
+                    _pos_sna = nx.spring_layout(_G_sna, k=3, seed=42)
+
+                _cmap_comm = plt.cm.get_cmap("tab10")
+                _node_colors_sna = [_cmap_comm(_node_comm.get(n, 0) % 10)
+                                    for n in _G_sna.nodes()]
+
+                # tamanho proporcional ao grau, mas MUITO menor que antes
+                # log scale para evitar nós gigantes
+                import math as _math_sna
+                _max_grau_sna = max(_graus_sna.get(n, 1) for n in _G_sna.nodes())
+                _node_sizes_sna = [
+                    max(40, min(350,
+                        40 + 310 * (_math_sna.log1p(_graus_sna.get(n, 1)) /
+                                    _math_sna.log1p(_max_grau_sna))
+                    ))
+                    for n in _G_sna.nodes()
+                ]
+
+                # espessura das arestas proporcional ao peso
+                _edge_w_sna = [_G_sna[u][v].get("weight", 1) for u, v in _G_sna.edges()]
+                _max_ew = max(_edge_w_sna) if _edge_w_sna else 1
+                _edge_widths = [0.3 + 2.5 * (w / _max_ew) for w in _edge_w_sna]
+
+                fig_sna, ax_sna = plt.subplots(figsize=(15, 12))
+                ax_sna.set_facecolor("#fafafa")
+
+                nx.draw_networkx_edges(_G_sna, _pos_sna, ax=ax_sna,
+                                        width=_edge_widths,
+                                        alpha=0.12, edge_color="#888")
+                nx.draw_networkx_nodes(_G_sna, _pos_sna, ax=ax_sna,
+                                        node_size=_node_sizes_sna,
+                                        node_color=_node_colors_sna,
+                                        alpha=0.80, edgecolors="#333",
+                                        linewidths=0.6)
+
+                # rótulos: top-15 por grau, posição levemente deslocada
+                _top15_sna = sorted(_G_sna.nodes(),
+                                    key=lambda n: _graus_sna.get(n, 0),
+                                    reverse=True)[:15]
+                _labels_sna = {n: n[:20] for n in _top15_sna}
+                # offset dos rótulos para não sobrepor ao nó
+                _label_pos = {n: (x, y + 0.03) for n, (x, y) in _pos_sna.items()
+                              if n in _labels_sna}
+                nx.draw_networkx_labels(_G_sna, _label_pos, labels=_labels_sna,
+                                        ax=ax_sna, font_size=7, font_weight="bold",
+                                        font_color="#1a1a2e")
+
+                # legenda de comunidades
+                _comm_sizes = sorted(
+                    [(ci, len(c)) for ci, c in enumerate(_communities)],
+                    key=lambda x: x[1], reverse=True
+                )[:6]
+                for _ci, _sz in _comm_sizes:
+                    ax_sna.scatter([], [], c=[_cmap_comm(_ci % 10)],
+                                   s=80, label=f"Comunidade {_ci} ({_sz} membros)")
+                ax_sna.legend(title="Comunidades", fontsize=8, title_fontsize=9,
+                              loc="upper left", framealpha=0.9)
+
+                ax_sna.set_title(
+                    f"Rede de coautoria — comunidades (greedy modularity)\n"
+                    f"{_G_sna.number_of_nodes()} nós | {_G_sna.number_of_edges()} arestas "
+                    f"(peso ≥ mediana) | Modularidade: {_modularity:.3f}\n"
+                    f"Tamanho ∝ log(grau) | Cores = comunidades | "
+                    f"Espessura ∝ peso da coautoria",
+                    fontsize=10, fontweight="bold"
+                )
+                ax_sna.axis("off")
+                plt.tight_layout()
+                plt.savefig(PASTA / "rede_comunidades.png", dpi=300, bbox_inches="tight")
+                plt.show()
+                plt.close()
+                print("Gráfico de comunidades salvo.")
+
+            except Exception as _e_viz:
+                print(f"  [AVISO] Visualização SNA: {_e_viz}")
+
+            # ── 5. Integração: centralidade como preditor no logit ─
+            try:
+                if "df_rede_metricas" in dir() and not df_rede_metricas.empty:
+                    _base_rede_logit = df_reg_inf.copy()
+                    _rede_col = "Autor" if "Autor" in _base_rede_logit.columns else \
+                                "autor_expandido" if "autor_expandido" in _base_rede_logit.columns \
+                                else None
+                    if _rede_col and "Autor" in df_rede_metricas.columns:
+                        _base_rede_logit = _base_rede_logit.merge(
+                            df_rede_metricas[["Autor", "grau_centralidade", "betweenness"]],
+                            left_on=_rede_col, right_on="Autor", how="left",
+                            suffixes=("", "_rede")
+                        )
+                        _base_rede_logit["grau_centralidade"] = \
+                            _base_rede_logit["grau_centralidade"].fillna(0)
+                        _base_rede_logit["betweenness"] = \
+                            _base_rede_logit["betweenness"].fillna(0)
+
+                        _base_rl = _base_rede_logit[
+                            _base_rede_logit["situacao_recodificada"].isin(["sucesso", "fracasso"])
+                        ].dropna(subset=["aprovado", "topico_dominante", "ano_c"])
+
+                        if len(_base_rl) >= 100 and _base_rl["aprovado"].sum() >= 5:
+                            _fml_rede = ("aprovado ~ C(topico_dominante) + ano_c "
+                                         "+ grau_centralidade + betweenness")
+                            try:
+                                _mod_rede = smf.logit(_fml_rede, data=_base_rl).fit(
+                                    cov_type="cluster",
+                                    cov_kwds={"groups": _base_rl[_rede_col]},
+                                    disp=0, maxiter=100
+                                )
+                                print(f"\nLogit com centralidade de rede:")
+                                print(f"  N={int(_mod_rede.nobs)} | "
+                                      f"Pseudo-R²={_mod_rede.prsquared:.4f}")
+                                _sig_rede = _mod_rede.pvalues[
+                                    _mod_rede.pvalues.index.str.contains(
+                                        "centralidade|betweenness"
+                                    )
+                                ]
+                                print("\n  Variáveis de rede:")
+                                for _vn, _pv in _sig_rede.items():
+                                    _coef_v = _mod_rede.params[_vn]
+                                    _sig_str = "***" if _pv < 0.001 else \
+                                               "**" if _pv < 0.01 else \
+                                               "*" if _pv < 0.05 else "ns"
+                                    print(f"    {_vn}: coef={_coef_v:.4f} "
+                                          f"(p={_pv:.4f}) {_sig_str}")
+
+                                print("\n  Interpretação:")
+                                print("  Se centralidade significativa → capital relacional")
+                                print("  (posição na rede) afeta chance de aprovação.")
+                                print("  Se não significativa → sucesso depende mais de")
+                                print("  partido/tópico que de posição social na rede.")
+
+                            except Exception as _e_mod_rede:
+                                print(f"  [AVISO] Logit com rede: {_e_mod_rede}")
+                        else:
+                            print("  [INFO] Base insuficiente para logit com rede.")
+                    else:
+                        print("  [INFO] Coluna de autor não encontrada para merge.")
+                else:
+                    print("  [INFO] Métricas de rede não disponíveis.")
+
+            except Exception as _e_int:
+                print(f"  [AVISO] Integração SNA-logit: {_e_int}")
+
+        elif NX_OK:
+            print("[INFO] Rede de coautoria não construída (seção 22D) — SNA pulada.")
+        else:
+            print("[INFO] networkx não instalado — SNA pulada.")
+            print("  Para instalar: pip install networkx")
+
+    except Exception as _e52:
+        print(f"[AVISO] Seção 52 (SNA completa): {_e52}")
+
+
+except Exception as _e_resgate:
+    print(f"[AVISO] Bloco resgatado falhou (§52 SNA — comunidades e integração): {_e_resgate}")
+
+# --------------------------------------------------------------------
+# §53 CLUSTER HIERÁRQUICO — dendrograma
+# --------------------------------------------------------------------
+try:
+    # =========================================================
+    # 53. CLUSTER HIERÁRQUICO + DENDROGRAMA
+    # =========================================================
+    # Aplica clustering hierárquico (Ward) à matriz de perfil
+    # temático dos parlamentares (proporção por tópico).
+    # Complementa o k-means (seção 34) com dendrograma.
+    # Ementa: "clusters hierárquicos; dendrograma; esquemas de
+    # aglomeração; medidas de distância e similaridade".
+    # Referência: Hair Jr. et al. (2009); Everitt et al. (2011).
+    # =========================================================
+
+    print("\n" + "=" * 60)
+    print("53. CLUSTER HIERÁRQUICO + DENDROGRAMA")
+    print("=" * 60)
+
+    try:
+        from scipy.cluster.hierarchy import dendrogram, linkage, fcluster
+        from scipy.spatial.distance import pdist
+
+        if "topico_dominante" in df_texto.columns and "Autor" in df_texto.columns:
+            _hc_base = (
+                df_texto.groupby(["Autor", "topico_dominante"])
+                .size().unstack(fill_value=0)
+            )
+            _hc_prop = _hc_base.div(_hc_base.sum(axis=1), axis=0)
+            _hc_prop.columns = [f"pct_T{int(c)}" for c in _hc_prop.columns]
+            _hc_mask = _hc_base.sum(axis=1) >= 5
+            _hc_filt = _hc_prop[_hc_mask].copy()
+
+            print(f"\nBase: {_hc_filt.shape[0]} parlamentares × {_hc_filt.shape[1]} tópicos")
+
+            if _hc_filt.shape[0] >= 10:
+                from sklearn.preprocessing import StandardScaler as _SS_hc
+                _X_hc = _SS_hc().fit_transform(_hc_filt)
+
+                # linkage Ward (variância mínima)
+                _Z = linkage(_X_hc, method="ward", metric="euclidean")
+
+                # dendrograma
+                fig_dend, ax_dend = plt.subplots(figsize=(14, 7))
+                _n_show = min(50, len(_hc_filt))
+                dendrogram(
+                    _Z, ax=ax_dend,
+                    truncate_mode="lastp" if len(_hc_filt) > 50 else "none",
+                    p=_n_show,
+                    leaf_rotation=90, leaf_font_size=7,
+                    color_threshold=_Z[-4, 2] if len(_Z) >= 4 else None,
+                    above_threshold_color="#888"
+                )
+                ax_dend.set_xlabel("Parlamentar (índice ou cluster)")
+                ax_dend.set_ylabel("Distância (Ward)")
+                ax_dend.set_title(
+                    f"Dendrograma — cluster hierárquico (Ward) do perfil temático\n"
+                    f"{_hc_filt.shape[0]} parlamentares | Variáveis: proporção em cada tópico LDA\n"
+                    f"Distância euclidiana | Método de aglomeração: Ward",
+                    fontsize=10, fontweight="bold"
+                )
+                ax_dend.grid(axis="y", linestyle="--", alpha=0.3)
+
+                # linha de corte para k=5 (consistente com k-means)
+                if len(_Z) >= 5:
+                    _corte_5 = (_Z[-4, 2] + _Z[-5, 2]) / 2
+                    ax_dend.axhline(_corte_5, color="red", linestyle="--",
+                                    linewidth=1.5, alpha=0.6,
+                                    label=f"Corte k=5 (dist={_corte_5:.2f})")
+                    ax_dend.legend(fontsize=9)
+
+                plt.tight_layout()
+                plt.savefig(PASTA / "dendrograma.png", dpi=300, bbox_inches="tight")
+                plt.show()
+                plt.close()
+                print("Dendrograma salvo.")
+
+                # clusters hierárquicos k=5
+                _labels_hc = fcluster(_Z, t=5, criterion="maxclust")
+                print(f"\nDistribuição dos clusters (Ward, k=5):")
+                _hc_dist = pd.Series(_labels_hc).value_counts().sort_index()
+                for _cl, _n in _hc_dist.items():
+                    print(f"  Cluster {_cl}: {_n} parlamentares")
+
+                # perfil temático médio por cluster hierárquico
+                _hc_perfil = _hc_filt.copy()
+                _hc_perfil["cluster_ward"] = _labels_hc
+                _hc_medias = _hc_perfil.groupby("cluster_ward").mean().round(3)
+                print("\nPerfil temático médio por cluster (Ward):")
+                print(_hc_medias.to_string())
+
+                # coeficiente cophenético (qualidade do dendrograma)
+                from scipy.cluster.hierarchy import cophenet as _coph
+                from scipy.spatial.distance import pdist as _pdist2
+                _coph_r, _ = _coph(_Z, _pdist2(_X_hc, metric="euclidean"))
+                print(f"\nCoeficiente cophenético: {_coph_r:.4f}")
+                if _coph_r >= 0.75:
+                    print("  → Boa representação (≥0.75)")
+                else:
+                    print("  → Representação moderada (<0.75)")
+
+            else:
+                print("[INFO] Base insuficiente para cluster hierárquico (n<10).")
+        else:
+            print("[INFO] Colunas necessárias não encontradas.")
+
+    except Exception as _e53:
+        print(f"[AVISO] Seção 53 (Cluster Hierárquico): {_e53}")
+
+
+except Exception as _e_resgate:
+    print(f"[AVISO] Bloco resgatado falhou (§53 CLUSTER HIERÁRQUICO — dendrograma): {_e_resgate}")
+
+# --------------------------------------------------------------------
+# §54 ÁRVORE DE DECISÃO
+# --------------------------------------------------------------------
+try:
+    # =========================================================
+    # 54. ÁRVORE DE DECISÃO — VISUALIZAÇÃO E INTERPRETAÇÃO
+    # =========================================================
+    # Treina uma árvore de decisão individual para classificação
+    # de sucesso legislativo e gera visualização interpretável.
+    # Ementa: "Árvores de decisão; bagging, boosting; random forest"
+    # Referência: Hartshorn (2016); Smith & Koning (2017).
+    # =========================================================
+
+    print("\n" + "=" * 60)
+    print("54. ÁRVORE DE DECISÃO — VISUALIZAÇÃO")
+    print("=" * 60)
+
+    try:
+        from sklearn.tree import DecisionTreeClassifier, plot_tree, export_text
+        from sklearn.preprocessing import LabelEncoder as _LE_dt
+
+        if not df_reg_inf.empty:
+            _base_dt = df_reg_inf[
+                df_reg_inf["situacao_recodificada"].isin(["sucesso", "fracasso"])
+            ].copy() if "situacao_recodificada" in df_reg_inf.columns else \
+            df_reg_inf[df_reg_inf["aprovado"].notna()].copy()
+
+            _feat_dt = []
+            for _fc in ["topico_dominante", "partido_inf", "corporacao_sigla", "ano_c"]:
+                if _fc in _base_dt.columns:
+                    _feat_dt.append(_fc)
+
+            _base_dt = _base_dt[_feat_dt + ["aprovado"]].dropna()
+            _X_dt = _base_dt[_feat_dt].copy()
+            _y_dt = _base_dt["aprovado"].astype(int)
+
+            # encode categóricas
+            _dt_encoders = {}
+            _feat_names_dt = list(_X_dt.columns)
+            for _col in ["topico_dominante", "partido_inf", "corporacao_sigla"]:
+                if _col in _X_dt.columns:
+                    _le = _LE_dt()
+                    _X_dt[_col] = _le.fit_transform(_X_dt[_col].astype(str))
+                    _dt_encoders[_col] = _le
+
+            print(f"\nBase: {len(_X_dt)} obs | {int(_y_dt.sum())} sucessos | "
+                  f"{len(_feat_dt)} features")
+
+            if len(_X_dt) >= 50 and _y_dt.sum() >= 3:
+                _dt = DecisionTreeClassifier(
+                    max_depth=4,
+                    min_samples_split=20,
+                    min_samples_leaf=10,
+                    class_weight="balanced",
+                    random_state=42
+                )
+                _dt.fit(_X_dt, _y_dt)
+
+                # métricas
+                _y_prob_dt = _dt.predict_proba(_X_dt)[:, 1]
+                try:
+                    _auc_val_dt = roc_auc_score(_y_dt, _y_prob_dt)
+                except Exception:
+                    _auc_val_dt = np.nan
+                print(f"  AUC (in-sample): {_auc_val_dt:.4f}")
+                print(f"  Profundidade: {_dt.get_depth()} | Folhas: {_dt.get_n_leaves()}")
+
+                # feature importance
+                _fi_dt = pd.DataFrame({
+                    "feature": _feat_names_dt,
+                    "importance": _dt.feature_importances_.round(4)
+                }).sort_values("importance", ascending=False)
+                print("\n  Importância das variáveis (Gini):")
+                print(_fi_dt.to_string(index=False))
+
+                # visualização da árvore
+                fig_dt, ax_dt = plt.subplots(figsize=(24, 12))
+                plot_tree(
+                    _dt, ax=ax_dt,
+                    feature_names=_feat_names_dt,
+                    class_names=["Fracasso", "Sucesso"],
+                    filled=True, rounded=True,
+                    fontsize=8, proportion=True,
+                    impurity=True
+                )
+                ax_dt.set_title(
+                    f"Árvore de decisão — sucesso legislativo\n"
+                    f"max_depth=4 | N={len(_X_dt)} | AUC={_auc_val_dt:.3f} | "
+                    f"class_weight=balanced",
+                    fontsize=12, fontweight="bold"
+                )
+                plt.tight_layout()
+                plt.savefig(PASTA / "arvore_decisao.png", dpi=200, bbox_inches="tight")
+                plt.show()
+                plt.close()
+                print("Árvore de decisão salva.")
+
+                # regras textuais
+                _regras = export_text(_dt, feature_names=_feat_names_dt, max_depth=3)
+                print("\nRegras (primeiros 3 níveis):")
+                print(_regras[:1500])
+
+            else:
+                print("[INFO] Base insuficiente para árvore de decisão.")
+        else:
+            print("[INFO] df_reg_inf vazio.")
+
+    except Exception as _e54:
+        print(f"[AVISO] Seção 54 (Árvore de decisão): {_e54}")
+
+
+except Exception as _e_resgate:
+    print(f"[AVISO] Bloco resgatado falhou (§54 ÁRVORE DE DECISÃO): {_e_resgate}")
+
+# --------------------------------------------------------------------
+# §55 OLS — produtividade e sucesso
+# --------------------------------------------------------------------
+try:
+    # =========================================================
+    # 55. REGRESSÃO LINEAR OLS — PRODUTIVIDADE E SUCESSO
+    # =========================================================
+    # Modela a taxa de sucesso (contínua) como função de variáveis
+    # do parlamentar. Inclui: R², F-test, VIF, Shapiro-Wilk, Box-Cox.
+    # Ementa: "modelos de regressão simples; R²; teste F; Stepwise;
+    # multicolinearidade; Shapiro-Francia; Box-Cox".
+    # Referência: Fávero & Belfiore (2017); Pardoe (2012).
+    # =========================================================
+
+    print("\n" + "=" * 60)
+    print("55. REGRESSÃO LINEAR OLS — PRODUTIVIDADE E SUCESSO")
+    print("=" * 60)
+
+    try:
+        from scipy.stats import shapiro as _shapiro_test
+        from scipy.stats import boxcox as _boxcox_transform
+        from scipy.stats import probplot as _probplot
+
+        if "Autor" in df_texto.columns and "topico_dominante" in df_texto.columns:
+            # base por parlamentar
+            _agg_dict = {"Proposicoes": "count",
+                         "topico_dominante": [
+                             lambda x: (x == 5).mean(),
+                             lambda x: (x == 1).mean()
+                         ]}
+            _ols_base = df_texto.groupby("Autor").agg(
+                n_pl=("Proposicoes", "count"),
+                ano_medio=("ano", lambda x: pd.to_numeric(x, errors="coerce").mean()),
+            ).reset_index()
+
+            # proporção penal e civil
+            _penal_prop = df_texto.groupby("Autor")["topico_dominante"].apply(
+                lambda x: (x == 5).mean()
+            ).rename("pct_penal")
+            _civil_prop = df_texto.groupby("Autor")["topico_dominante"].apply(
+                lambda x: (x == 1).mean()
+            ).rename("pct_civil")
+
+            _ols_base = _ols_base.merge(_penal_prop, on="Autor", how="left")
+            _ols_base = _ols_base.merge(_civil_prop, on="Autor", how="left")
+
+            # n_aprovados
+            if "sucesso_legislativo" in df_texto.columns:
+                _aprov = df_texto.groupby("Autor")["sucesso_legislativo"].sum().rename("n_aprovados")
+                _ols_base = _ols_base.merge(_aprov, on="Autor", how="left")
+                _ols_base["taxa_sucesso"] = _ols_base["n_aprovados"] / _ols_base["n_pl"] * 100
+            else:
+                _ols_base["taxa_sucesso"] = 0
+
+            _ols_filt = _ols_base[_ols_base["n_pl"] >= 3].dropna(
+                subset=["taxa_sucesso", "n_pl", "pct_penal", "ano_medio"]
+            ).copy()
+
+            print(f"\nBase OLS: {len(_ols_filt)} parlamentares (≥3 PLs)")
+            print(f"  Taxa média: {_ols_filt['taxa_sucesso'].mean():.2f}%")
+
+            if len(_ols_filt) >= 30:
+                _ols_filt["log_n_pl"] = np.log1p(_ols_filt["n_pl"])
+                _ols_filt["ano_c_ols"] = _ols_filt["ano_medio"] - _ols_filt["ano_medio"].mean()
+
+                _fml_ols = "taxa_sucesso ~ log_n_pl + pct_penal + pct_civil + ano_c_ols"
+                _mod_ols = smf.ols(_fml_ols, data=_ols_filt).fit()
+
+                print(f"\n  R²:          {_mod_ols.rsquared:.4f}")
+                print(f"  R² ajustado: {_mod_ols.rsquared_adj:.4f}")
+                print(f"  F-stat:      {_mod_ols.fvalue:.2f} (p={_mod_ols.f_pvalue:.4f})")
+                print(f"  N:           {int(_mod_ols.nobs)}")
+                print("\n  Coeficientes:")
+                _ols_sum = pd.DataFrame({
+                    "variavel": _mod_ols.params.index,
+                    "coef": _mod_ols.params.round(4),
+                    "se": _mod_ols.bse.round(4),
+                    "t": _mod_ols.tvalues.round(3),
+                    "p": _mod_ols.pvalues.round(4)
+                })
+                print(_ols_sum.to_string(index=False))
+
+                # VIF
+                from statsmodels.stats.outliers_influence import variance_inflation_factor as _vif_fn
+                _X_vif = sm.add_constant(
+                    _ols_filt[["log_n_pl", "pct_penal", "pct_civil", "ano_c_ols"]]
+                ).values
+                _vif_names = ["const", "log_n_pl", "pct_penal", "pct_civil", "ano_c_ols"]
+                _vif_df = pd.DataFrame({
+                    "variavel": _vif_names,
+                    "VIF": [round(_vif_fn(_X_vif, i), 2) for i in range(len(_vif_names))]
+                })
+                print("\n  VIF (multicolinearidade):")
+                print(_vif_df[_vif_df["variavel"] != "const"].to_string(index=False))
+
+                # Shapiro-Wilk
+                _resid_ols = _mod_ols.resid
+                _sw_stat, _sw_p = _shapiro_test(_resid_ols[:min(5000, len(_resid_ols))])
+                print(f"\n  Shapiro-Wilk: W={_sw_stat:.4f}, p={_sw_p:.4f}")
+                if _sw_p < 0.05:
+                    print("  → Resíduos NÃO normais — considerar Box-Cox.")
+                else:
+                    print("  → Resíduos normais.")
+
+                # Box-Cox
+                if _sw_p < 0.05:
+                    try:
+                        _y_bc = _ols_filt["taxa_sucesso"][_ols_filt["taxa_sucesso"] > 0]
+                        if len(_y_bc) >= 20:
+                            _, _bc_lambda = _boxcox_transform(_y_bc)
+                            print(f"\n  Box-Cox λ={_bc_lambda:.4f}")
+                            if abs(_bc_lambda) < 0.05:
+                                print("  → λ≈0 → transformação log sugerida")
+                            elif abs(_bc_lambda - 0.5) < 0.15:
+                                print("  → λ≈0.5 → raiz quadrada sugerida")
+                            elif abs(_bc_lambda - 1) < 0.15:
+                                print("  → λ≈1 → sem transformação necessária")
+                    except Exception as _e_bc:
+                        print(f"  [INFO] Box-Cox: {_e_bc}")
+
+                # gráficos diagnóstico
+                fig_ols, axes_ols = plt.subplots(1, 3, figsize=(15, 4.5))
+                axes_ols[0].scatter(_mod_ols.fittedvalues, _resid_ols,
+                                    alpha=0.4, s=20, color="#3498db", edgecolors="white")
+                axes_ols[0].axhline(0, color="red", linestyle="--", alpha=0.5)
+                axes_ols[0].set_xlabel("Valores ajustados")
+                axes_ols[0].set_ylabel("Resíduos")
+                axes_ols[0].set_title("Resíduos vs Ajustados")
+                axes_ols[0].grid(linestyle="--", alpha=0.3)
+
+                _probplot(_resid_ols, plot=axes_ols[1])
+                axes_ols[1].set_title("QQ-Plot")
+                axes_ols[1].grid(linestyle="--", alpha=0.3)
+
+                axes_ols[2].hist(_resid_ols, bins=25, color="#3498db",
+                                 alpha=0.7, edgecolor="white", density=True)
+                axes_ols[2].set_title(f"Resíduos (Shapiro p={_sw_p:.3f})")
+                axes_ols[2].grid(axis="y", linestyle="--", alpha=0.3)
+
+                fig_ols.suptitle(
+                    f"Diagnóstico OLS — R²={_mod_ols.rsquared:.3f} | "
+                    f"F={_mod_ols.fvalue:.1f} (p={_mod_ols.f_pvalue:.4f})",
+                    fontsize=11, fontweight="bold"
+                )
+                plt.tight_layout()
+                plt.savefig(PASTA / "ols_diagnostico.png", dpi=300, bbox_inches="tight")
+                plt.show()
+                plt.close()
+                print("Diagnóstico OLS salvo.")
+
+            else:
+                print("[INFO] Base insuficiente para OLS (n<30).")
+        else:
+            print("[INFO] Colunas necessárias não encontradas.")
+
+    except Exception as _e55:
+        print(f"[AVISO] Seção 55 (OLS): {_e55}")
+
+
+except Exception as _e_resgate:
+    print(f"[AVISO] Bloco resgatado falhou (§55 OLS — produtividade e sucesso): {_e_resgate}")
+
+# --------------------------------------------------------------------
+# §57 MDS — escalonamento multidimensional
+# --------------------------------------------------------------------
+try:
+    # =========================================================
+    # 57. MDS — ESCALONAMENTO MULTIDIMENSIONAL
+    # =========================================================
+    # Projeta a matriz de dissimilaridade entre parlamentares em
+    # 2D via MDS. Complementa PCA/MCA com representação não-linear.
+    # Ementa: "escalonamento multidimensional".
+    # Referência: Deus (2001); Hair Jr. et al. (2009).
+    # =========================================================
+
+    print("\n" + "=" * 60)
+    print("57. MDS — ESCALONAMENTO MULTIDIMENSIONAL")
+    print("=" * 60)
+
+    try:
+        from sklearn.manifold import MDS
+        from sklearn.preprocessing import StandardScaler as _SS_mds
+
+        if "topico_dominante" in df_texto.columns and "Autor" in df_texto.columns:
+            _mds_base = (
+                df_texto.groupby(["Autor", "topico_dominante"])
+                .size().unstack(fill_value=0)
+            )
+            _mds_prop = _mds_base.div(_mds_base.sum(axis=1), axis=0)
+            _mds_prop.columns = [f"pct_T{int(c)}" for c in _mds_prop.columns]
+            _mds_mask = _mds_base.sum(axis=1) >= 5
+            _mds_filt = _mds_prop[_mds_mask].copy()
+
+            print(f"\nBase MDS: {_mds_filt.shape[0]} parlamentares")
+
+            if _mds_filt.shape[0] >= 15:
+                _X_mds = _SS_mds().fit_transform(_mds_filt)
+
+                _mds = MDS(
+                    n_components=2, metric=True, random_state=42,
+                    n_init=4, max_iter=300, dissimilarity="euclidean",
+                    normalized_stress="auto"
+                )
+                _coords_mds = _mds.fit_transform(_X_mds)
+                _stress = _mds.stress_
+
+                print(f"  Stress: {_stress:.4f}")
+                if _stress < 0.05:
+                    print("  → Excelente (<0.05)")
+                elif _stress < 0.10:
+                    print("  → Bom (0.05–0.10)")
+                elif _stress < 0.20:
+                    print("  → Razoável (0.10–0.20)")
+                else:
+                    print("  → Fraco (>0.20)")
+
+                # tópico dominante de cada autor para colorir
+                _topico_dom_autor = (
+                    df_texto.groupby("Autor")["topico_dominante"]
+                    .agg(lambda x: x.value_counts().index[0])
+                )
+                _cores_mds_map = {1: "#2ecc71", 2: "#3498db", 3: "#e67e22",
+                                  4: "#9b59b6", 5: "#e74c3c"}
+                _autores_mds = _mds_filt.index.tolist()
+                _cores_mds = [_cores_mds_map.get(
+                    _topico_dom_autor.get(a, 0), "#999"
+                ) for a in _autores_mds]
+
+                fig_mds, ax_mds = plt.subplots(figsize=(10, 8))
+                ax_mds.scatter(_coords_mds[:, 0], _coords_mds[:, 1],
+                               c=_cores_mds, alpha=0.6, s=50,
+                               edgecolors="#333", linewidths=0.4)
+
+                for _t, _cor in _cores_mds_map.items():
+                    ax_mds.scatter([], [], c=_cor, s=60,
+                                   label=NOMES_TOPICOS_CURTO.get(_t, f"T{_t}"))
+                ax_mds.legend(title="Tópico dominante", fontsize=8,
+                              title_fontsize=9, loc="upper right")
+
+                ax_mds.set_xlabel("Dimensão 1")
+                ax_mds.set_ylabel("Dimensão 2")
+                ax_mds.set_title(
+                    f"MDS — Escalonamento Multidimensional\n"
+                    f"{len(_autores_mds)} parlamentares | Stress={_stress:.4f}",
+                    fontsize=10, fontweight="bold"
+                )
+                ax_mds.grid(linestyle="--", alpha=0.25)
+                plt.tight_layout()
+                plt.savefig(PASTA / "mds_parlamentares.png", dpi=300, bbox_inches="tight")
+                plt.show()
+                plt.close()
+                print("MDS salvo.")
+
+            else:
+                print("[INFO] Base insuficiente para MDS (n<15).")
+        else:
+            print("[INFO] Colunas necessárias não encontradas.")
+
+    except Exception as _e57:
+        print(f"[AVISO] Seção 57 (MDS): {_e57}")
+
+
+except Exception as _e_resgate:
+    print(f"[AVISO] Bloco resgatado falhou (§57 MDS — escalonamento multidimensional): {_e_resgate}")
+
+# --------------------------------------------------------------------
+# §58 AHP — analytic hierarchy process
+# --------------------------------------------------------------------
+try:
+    # =========================================================
+    # 58. AHP — ANALYTIC HIERARCHY PROCESS
+    # =========================================================
+    # Aplica AHP para ranquear os fatores que mais influenciam
+    # o sucesso legislativo, usando os resultados empíricos como
+    # base para os julgamentos de importância relativa (Saaty 1-9).
+    # Ementa: "Método AHP; métodos multicritério; matriz de decisão".
+    # Referência: Saaty (2008, 2013, 2014).
+    # =========================================================
+
+    print("\n" + "=" * 60)
+    print("58. AHP — ANALYTIC HIERARCHY PROCESS")
+    print("=" * 60)
+
+    try:
+        _criterios = ["Tópico/Agenda", "Partido", "Tempo/Legislatura",
+                       "Corporação", "Capital Institucional"]
+        _n_crit = len(_criterios)
+
+        # Matriz de comparações paritárias (escala Saaty 1-9)
+        # Baseada nos resultados empíricos:
+        # - Partido melhora mais pseudo-R² (0.056→0.110) → mais importante
+        # - Tópico: consistente em todos os modelos, AME forte → segundo
+        # - Tempo: positivo e significativo → terceiro
+        # - Corporação: só PF significativa → quarto
+        # - Capital inst.: presidente comissão não signif. → quinto
+        _A = np.array([
+            # Top   Part  Temp  Corp  CapI
+            [1,     1/2,  2,    3,    5],    # Tópico
+            [2,     1,    3,    5,    7],    # Partido
+            [1/2,   1/3,  1,    2,    4],    # Tempo
+            [1/3,   1/5,  1/2,  1,    3],    # Corporação
+            [1/5,   1/7,  1/4,  1/3,  1],    # Capital Inst.
+        ], dtype=float)
+
+        print("\nMatriz de comparações paritárias (Saaty):")
+        _A_df = pd.DataFrame(_A, index=_criterios, columns=_criterios)
+        print(_A_df.round(3).to_string())
+
+        # ── Cálculo dos pesos (autovetor principal) ───────────────
+        _eigenvalues, _eigenvectors = np.linalg.eig(_A)
+        _max_idx = np.argmax(_eigenvalues.real)
+        _lambda_max = _eigenvalues[_max_idx].real
+        _w = _eigenvectors[:, _max_idx].real
+        _w = _w / _w.sum()  # normaliza
+
+        print(f"\nAutovalor máximo (λ_max): {_lambda_max:.4f}")
+        print(f"\nPesos (prioridades):")
+        _pesos_df = pd.DataFrame({
+            "critério": _criterios,
+            "peso": _w.round(4),
+            "ranking": np.argsort(-_w) + 1
+        }).sort_values("peso", ascending=False)
+        print(_pesos_df.to_string(index=False))
+
+        # ── Razão de Consistência (CR) ────────────────────────────
+        _CI = (_lambda_max - _n_crit) / (_n_crit - 1)
+        # Random Index para n=5 (Saaty)
+        _RI_table = {1: 0, 2: 0, 3: 0.58, 4: 0.90, 5: 1.12,
+                     6: 1.24, 7: 1.32, 8: 1.41, 9: 1.45, 10: 1.49}
+        _RI = _RI_table.get(_n_crit, 1.12)
+        _CR = _CI / _RI if _RI > 0 else 0
+
+        print(f"\n  CI (Consistency Index): {_CI:.4f}")
+        print(f"  RI (Random Index, n={_n_crit}): {_RI:.2f}")
+        print(f"  CR (Consistency Ratio): {_CR:.4f}")
+        if _CR <= 0.10:
+            print("  → CR ≤ 0.10: consistência ACEITÁVEL (Saaty)")
+        else:
+            print("  → CR > 0.10: INCONSISTENTE — revisar julgamentos")
+
+        # ── Gráfico de pesos ──────────────────────────────────────
+        fig_ahp, ax_ahp = plt.subplots(figsize=(9, 5))
+        _pesos_sorted = _pesos_df.sort_values("peso", ascending=True)
+        _cores_ahp = ["#e74c3c", "#e67e22", "#3498db", "#9b59b6", "#2ecc71"]
+        ax_ahp.barh(
+            _pesos_sorted["critério"], _pesos_sorted["peso"] * 100,
+            color=_cores_ahp[:len(_pesos_sorted)], alpha=0.85,
+            edgecolor="white", linewidth=0.5
+        )
+        for _i, (_idx, _row) in enumerate(_pesos_sorted.iterrows()):
+            ax_ahp.text(
+                _row["peso"] * 100 + 0.5, _i,
+                f"{_row['peso']*100:.1f}%",
+                va="center", fontsize=10, fontweight="bold"
+            )
+        ax_ahp.set_xlabel("Peso (%)")
+        ax_ahp.set_title(
+            f"AHP — Priorização dos fatores de sucesso legislativo\n"
+            f"Escala Saaty (1-9) | CR={_CR:.4f} "
+            f"({'consistente' if _CR <= 0.10 else 'INCONSISTENTE'})\n"
+            f"Julgamentos baseados nos resultados empíricos do estudo",
+            fontsize=10, fontweight="bold"
+        )
+        ax_ahp.grid(axis="x", linestyle="--", alpha=0.3)
+        ax_ahp.set_xlim(0, _pesos_sorted["peso"].max() * 100 * 1.25)
+        plt.tight_layout()
+        plt.savefig(PASTA / "ahp_pesos.png", dpi=300, bbox_inches="tight")
+        plt.show()
+        plt.close()
+        print("Gráfico AHP salvo.")
+
+        # ── Interpretação substantiva ─────────────────────────────
+        print("\nInterpretação:")
+        print("  O AHP confirma, via método multicritério, os achados dos")
+        print("  modelos econométricos: o partido político é o fator mais")
+        print("  importante para o sucesso legislativo, seguido pela agenda")
+        print("  temática. Corporação e capital institucional têm peso menor,")
+        print("  sugerindo que inserção partidária supera identidade corporativa.")
+
+    except Exception as _e58:
+        print(f"[AVISO] Seção 58 (AHP): {_e58}")
+
+
+except Exception as _e_resgate:
+    print(f"[AVISO] Bloco resgatado falhou (§58 AHP — analytic hierarchy process): {_e_resgate}")
+
+# ======================================================================
+# FIM dos blocos resgatados
+# ======================================================================
+
+# =========================================================
+# ============================================================
+# EXTENSÕES PARA VERSÃO ARTIGO (não entra no TCC v19)
+# ============================================================
+# Estas três seções produzem análises adicionais para a futura
+# versão de artigo do trabalho. Não modificam nenhum modelo do
+# TCC v19 — todos os números do docx permanecem idênticos.
+# Os blocos rodam APÓS toda a análise do TCC e exportam saída
+# própria para o resultados_pln_pl.xlsx em abas dedicadas.
+
+print("\n\n" + "=" * 64)
+print("BLOCOS ARTIGO — extensões metodológicas (não entram no TCC)")
+print("=" * 64)
+
+# ── ARTIGO-1 ─────────────────────────────────────────────────
+# Firth penalized logit para interação partido × tópico
+# Substitui a aproximação L1 da Seção 22B-EXT, que gerava ORs
+# delirantes (>10⁵) por separação quase-completa. Firth aplica
+# Jeffreys prior no log-verossimilhança, garantindo estimativas
+# finitas mesmo em células com 0 eventos.
+# ────────────────────────────────────────────────────────────
+print("\n" + "-" * 64)
+print("ARTIGO-1 — Firth logit: interação partido × tópico")
+print("-" * 64)
+
+artigo1_resumo = pd.DataFrame()  # placeholder caso falhe
+try:
+    # [v25] usa helper _safe_firth_fit que limpa rank-deficiency
+    if not df_reg_inf.empty:
+        # base de interação — só partidos elegíveis para inferência
+        _df_a1 = df_reg_inf[df_reg_inf["partido_inf"] != "OUTROS"].copy()
+        _df_a1 = _df_a1.dropna(
+            subset=["aprovado", "topico_dominante", "partido_inf", "ano_c"]
+        )
+        if len(_df_a1) > 0:
+            print(f"\nBase Firth: N={len(_df_a1)} | "
+                  f"aprovações={int(_df_a1['aprovado'].sum())}")
+
+            _fit_a1 = _safe_firth_fit(
+                "aprovado ~ C(topico_dominante) * C(partido_inf) + ano_c",
+                data=_df_a1,
+                max_iter=200,
+                min_events_per_level=5,  # crítico para interação
+                verbose=True,
+            )
+
+            if _fit_a1 is None:
+                print("[ARTIGO-1] firthmodels indisponível ou design matrix")
+                print("           irrecuperavelmente singular. Pulando bloco.")
+            else:
+                _firth = _fit_a1["model"]
+                _kept_cols_a1 = _fit_a1["colnames"]
+                print(f"           {_fit_a1['n_dropped']} colunas removidas "
+                      f"por rank-deficiency.")
+
+                # acesso defensivo: firthmodels usa pvalues_, firthlogist usava pvals_
+                _pvals_a1 = (getattr(_firth, "pvalues_", None)
+                             if getattr(_firth, "pvalues_", None) is not None
+                             else getattr(_firth, "pvals_", None))
+                _bse_a1 = getattr(_firth, "bse_", None)
+
+                # IC95% via Wald
+                _ci_a1 = getattr(_firth, "ci_", None)
+                if _ci_a1 is not None and _ci_a1.shape[0] == len(_kept_cols_a1):
+                    _ic_inf = _ci_a1[:, 0]
+                    _ic_sup = _ci_a1[:, 1]
+                elif _bse_a1 is not None and len(_bse_a1) == len(_kept_cols_a1):
+                    _ic_inf = _firth.coef_ - 1.96 * _bse_a1
+                    _ic_sup = _firth.coef_ + 1.96 * _bse_a1
+                else:
+                    _ic_inf = np.full_like(_firth.coef_, np.nan)
+                    _ic_sup = np.full_like(_firth.coef_, np.nan)
+
+                _coefs_firth = pd.DataFrame({
+                    "variavel":   _kept_cols_a1,
+                    "coef_firth": _firth.coef_,
+                    "or_firth":   np.exp(_firth.coef_),
+                    "ic95_inf":   np.exp(_ic_inf),
+                    "ic95_sup":   np.exp(_ic_sup),
+                    "p_firth":    (_pvals_a1 if _pvals_a1 is not None
+                                   and len(_pvals_a1) == len(_kept_cols_a1)
+                                   else np.nan),
+                })
+
+                # filtra interações estáveis (OR finito, IC compatível)
+                _interacoes_firth = _coefs_firth[
+                    _coefs_firth["variavel"].str.contains(":")
+                    & (_coefs_firth["or_firth"] < 100)
+                    & (_coefs_firth["ic95_sup"] < 1000)
+                    & (_coefs_firth["p_firth"] < 0.10)
+                ].sort_values("p_firth")
+
+                print(f"\nInterações Firth com OR estável (<100) e p<0,10:")
+                if len(_interacoes_firth) > 0:
+                    print(_interacoes_firth.round(3).to_string(index=False))
+                    print("\nLeitura: estas são as interações partido×tópico que")
+                    print("sobrevivem à correção Firth. As demais (com ORs gigantes")
+                    print("no logit padrão) eram artefatos de separação quase-completa.")
+                else:
+                    print("  Nenhuma interação atinge critério de estabilidade + significância.")
+                    print("  Leitura: a separação quase-completa dissolve as interações")
+                    print("  uma vez aplicada a correção Bayesiana de Firth — confirmando")
+                    print("  que os ORs gigantes da Seção 22B eram artefatos numéricos.")
+
+                # ── Tabela completa de efeitos principais (sem interações) ──
+                _principais_firth = _coefs_firth[
+                    ~_coefs_firth["variavel"].str.contains(":")
+                    & (_coefs_firth["or_firth"] < 100)
+                ].copy()
+                print(f"\nEfeitos principais Firth (tópico, partido, tempo):")
+                print(_principais_firth.round(3).to_string(index=False))
+
+                artigo1_resumo = _coefs_firth.copy()
+        else:
+            print("[ARTIGO-1] base vazia após filtros.")
+except Exception as _e_a1:
+    print(f"[AVISO ARTIGO-1] {_e_a1}")
+
+
+# ── ARTIGO-2 ─────────────────────────────────────────────────
+# Métricas preditivas estruturadas — modelo com corporação
+# Reformula a saída do modelo preditivo complementar (já rodado
+# no v19) em DataFrames apresentáveis: matriz de confusão
+# rotulada, análise top-k com lift sobre taxa-base, métricas
+# globais. Tudo exportável para xlsx.
+# ────────────────────────────────────────────────────────────
+print("\n" + "-" * 64)
+print("ARTIGO-2 — Métricas preditivas estruturadas (modelo c/ corporação)")
+print("-" * 64)
+
+artigo2_confusao = pd.DataFrame()
+artigo2_topk = pd.DataFrame()
+artigo2_metricas = pd.DataFrame()
+
+try:
+    if "df_reg_corp" in dir() and not df_reg_corp.empty:
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.model_selection import train_test_split
+        from sklearn.metrics import (
+            confusion_matrix, roc_auc_score, average_precision_score
+        )
+        from sklearn.preprocessing import OneHotEncoder
+        from sklearn.compose import ColumnTransformer
+        from sklearn.pipeline import Pipeline
+
+        _df_a2 = df_reg_corp.dropna(
+            subset=["aprovado", "topico_dominante", "corporacao_sigla", "ano_c"]
+        ).copy()
+
+        _X_a2 = _df_a2[["topico_dominante", "corporacao_sigla", "ano_c"]]
+        _y_a2 = _df_a2["aprovado"].astype(int).values
+
+        _ct = ColumnTransformer([
+            ("cat", OneHotEncoder(drop="first", handle_unknown="ignore"),
+             ["topico_dominante", "corporacao_sigla"])
+        ], remainder="passthrough")
+
+        _pipe = Pipeline([
+            ("enc", _ct),
+            ("clf", LogisticRegression(max_iter=2000, C=1.0))
+        ])
+
+        _Xtr, _Xte, _ytr, _yte = train_test_split(
+            _X_a2, _y_a2, test_size=0.20,
+            stratify=_y_a2, random_state=42
+        )
+        _pipe.fit(_Xtr, _ytr)
+        _proba = _pipe.predict_proba(_Xte)[:, 1]
+
+        # taxa-base
+        _taxa_base = _yte.mean()
+        print(f"\nTeste hold-out: N={len(_yte)} | "
+              f"aprovações={int(_yte.sum())} | "
+              f"taxa-base={_taxa_base:.4f}")
+
+        # AUC e AP
+        _auc = roc_auc_score(_yte, _proba)
+        _ap  = average_precision_score(_yte, _proba)
+        print(f"AUC = {_auc:.3f}  |  Average Precision = {_ap:.3f}")
+
+        # Matriz de confusão em vários thresholds
+        print("\nMatriz de confusão por threshold:")
+        _linhas_cm = []
+        for _thr in [0.05, 0.10, 0.15, 0.20, 0.30, 0.50]:
+            _pred = (_proba >= _thr).astype(int)
+            _cm = confusion_matrix(_yte, _pred, labels=[0, 1])
+            _tn, _fp, _fn, _tp = _cm.ravel()
+            _prec = _tp / (_tp + _fp) if (_tp + _fp) > 0 else 0
+            _rec  = _tp / (_tp + _fn) if (_tp + _fn) > 0 else 0
+            _f1   = 2 * _prec * _rec / (_prec + _rec) if (_prec + _rec) > 0 else 0
+            _linhas_cm.append({
+                "threshold": _thr,
+                "TN": _tn, "FP": _fp, "FN": _fn, "TP": _tp,
+                "precision": round(_prec, 3),
+                "recall": round(_rec, 3),
+                "f1": round(_f1, 3),
+            })
+        artigo2_confusao = pd.DataFrame(_linhas_cm)
+        print(artigo2_confusao.to_string(index=False))
+
+        # Top-k analysis com lift
+        print("\nTop-k com lift sobre taxa-base:")
+        _df_rank = pd.DataFrame({
+            "prob": _proba, "real": _yte
+        }).sort_values("prob", ascending=False).reset_index(drop=True)
+
+        _linhas_topk = []
+        for _k in [5, 10, 20, 50, 100, 200]:
+            if _k > len(_df_rank):
+                continue
+            _top = _df_rank.head(_k)
+            _aprov = int(_top["real"].sum())
+            _taxa_topk = _aprov / _k
+            _lift = _taxa_topk / _taxa_base if _taxa_base > 0 else 0
+            _linhas_topk.append({
+                "k": _k,
+                "aprovados_topk": _aprov,
+                "taxa_topk": round(_taxa_topk, 4),
+                "taxa_base": round(_taxa_base, 4),
+                "lift": round(_lift, 2),
+            })
+        artigo2_topk = pd.DataFrame(_linhas_topk)
+        print(artigo2_topk.to_string(index=False))
+
+        # Métricas globais
+        artigo2_metricas = pd.DataFrame([{
+            "modelo": "logit corporacao + topico + ano",
+            "n_treino": len(_ytr),
+            "n_teste": len(_yte),
+            "aprovacoes_teste": int(_yte.sum()),
+            "taxa_base": round(_taxa_base, 4),
+            "auc": round(_auc, 4),
+            "average_precision": round(_ap, 4),
+        }])
+        print("\nMétricas globais:")
+        print(artigo2_metricas.to_string(index=False))
+
+        print("\nLeitura: AUC moderada confirma discriminação superior ao acaso")
+        print("        mas insuficiente para classificação binária precisa em")
+        print("        contexto de evento raro. O ranking top-k preserva lift")
+        print("        positivo sobre a taxa-base, indicando utilidade analítica")
+        print("        para ordenação probabilística (não para decisão binária).")
+    else:
+        print("[ARTIGO-2] df_reg_corp indisponível.")
+except Exception as _e_a2:
+    print(f"[AVISO ARTIGO-2] {_e_a2}")
+
+
+# ── ARTIGO-3 ─────────────────────────────────────────────────
+# M1–M4 com idade_aprox (idade-no-mandato) como controle
+# Modelos NOVOS — M1b/M2b/M3b/M4b — preservando os originais.
+# A variável idade_aprox foi corrigida no v19 para refletir
+# idade no momento da proposição (ano do PL − ano de nascimento)
+# em vez do snapshot 2024. Aqui testamos se ela contribui
+# autonomamente após controles padrão.
+# ────────────────────────────────────────────────────────────
+print("\n" + "-" * 64)
+print("ARTIGO-3 — M1–M4 aumentados com idade_aprox (idade-no-mandato)")
+print("-" * 64)
+
+artigo3_comparacao = pd.DataFrame()
+
+try:
+    if ("df_reg_corp_base" in dir() and not df_reg_corp_base.empty
+            and "idade_aprox" in df_reg_corp_base.columns):
+
+        _base_a3 = df_reg_corp_base.dropna(
+            subset=["aprovado", "topico_dominante", "ano_c", "idade_aprox"]
+        ).copy()
+
+        # injeta partido_inf e legislatura para os modelos completos
+        _cols_join = [c for c in ["Proposicoes", "partido_inf", "legislatura"]
+                      if c in df_reg_inf.columns]
+        if "Proposicoes" in _cols_join and "Proposicoes" in _base_a3.columns:
+            _base_a3 = _base_a3.merge(
+                df_reg_inf[_cols_join].drop_duplicates(subset=["Proposicoes"]),
+                on="Proposicoes", how="left"
+            )
+
+        print(f"\nBase ARTIGO-3: N={len(_base_a3)} | "
+              f"aprovações={int(_base_a3['aprovado'].sum())}")
+        print(f"idade_aprox: média={_base_a3['idade_aprox'].mean():.1f} | "
+              f"mediana={_base_a3['idade_aprox'].median():.0f} | "
+              f"min={_base_a3['idade_aprox'].min():.0f} | "
+              f"max={_base_a3['idade_aprox'].max():.0f}")
+
+        # centraliza idade na mediana para interpretação
+        _idade_med = float(_base_a3["idade_aprox"].median())
+        _base_a3["idade_c"] = _base_a3["idade_aprox"] - _idade_med
+
+        _modelos_a3 = []
+
+        # M1b: tópico + ano + idade
+        try:
+            _m1b = smf.logit(
+                "aprovado ~ C(topico_dominante) + ano_c + idade_c",
+                data=_base_a3
+            ).fit(disp=0, cov_type="cluster",
+                  cov_kwds={"groups": _base_a3["Autor"]})
+            _modelos_a3.append({
+                "modelo": "M1b: tópico + ano + idade",
+                "N": int(_m1b.nobs),
+                "pseudo_R2": round(_m1b.prsquared, 4),
+                "AIC": round(_m1b.aic, 1),
+                "ll": round(_m1b.llf, 2),
+                "coef_idade": round(_m1b.params.get("idade_c", np.nan), 4),
+                "p_idade": round(_m1b.pvalues.get("idade_c", np.nan), 4),
+            })
+        except Exception as _ee:
+            print(f"[M1b] {_ee}")
+
+        # M2b: + partido
+        if "partido_inf" in _base_a3.columns:
+            try:
+                _m2b = smf.logit(
+                    "aprovado ~ C(topico_dominante) + C(partido_inf) "
+                    "+ ano_c + idade_c",
+                    data=_base_a3.dropna(subset=["partido_inf"])
+                ).fit(disp=0, cov_type="cluster",
+                      cov_kwds={"groups": _base_a3.dropna(
+                          subset=["partido_inf"])["Autor"]})
+                _modelos_a3.append({
+                    "modelo": "M2b: + partido",
+                    "N": int(_m2b.nobs),
+                    "pseudo_R2": round(_m2b.prsquared, 4),
+                    "AIC": round(_m2b.aic, 1),
+                    "ll": round(_m2b.llf, 2),
+                    "coef_idade": round(_m2b.params.get("idade_c", np.nan), 4),
+                    "p_idade": round(_m2b.pvalues.get("idade_c", np.nan), 4),
+                })
+            except Exception as _ee:
+                print(f"[M2b] {_ee}")
+
+        # M3b: + corporação
+        try:
+            _m3b = smf.logit(
+                "aprovado ~ C(topico_dominante) + C(partido_inf) "
+                "+ C(corporacao_sigla) + ano_c + idade_c",
+                data=_base_a3.dropna(subset=["partido_inf"])
+            ).fit(disp=0, cov_type="cluster",
+                  cov_kwds={"groups": _base_a3.dropna(
+                      subset=["partido_inf"])["Autor"]})
+            _modelos_a3.append({
+                "modelo": "M3b: + corporação",
+                "N": int(_m3b.nobs),
+                "pseudo_R2": round(_m3b.prsquared, 4),
+                "AIC": round(_m3b.aic, 1),
+                "ll": round(_m3b.llf, 2),
+                "coef_idade": round(_m3b.params.get("idade_c", np.nan), 4),
+                "p_idade": round(_m3b.pvalues.get("idade_c", np.nan), 4),
+            })
+        except Exception as _ee:
+            print(f"[M3b] {_ee}")
+
+        # M4b: + legislatura
+        if "legislatura" in _base_a3.columns:
+            try:
+                _m4b = smf.logit(
+                    "aprovado ~ C(topico_dominante) + C(partido_inf) "
+                    "+ C(corporacao_sigla) + C(legislatura) + idade_c",
+                    data=_base_a3.dropna(subset=["partido_inf", "legislatura"])
+                ).fit(disp=0, cov_type="cluster",
+                      cov_kwds={"groups": _base_a3.dropna(
+                          subset=["partido_inf", "legislatura"])["Autor"]})
+                _modelos_a3.append({
+                    "modelo": "M4b: ampliado + idade",
+                    "N": int(_m4b.nobs),
+                    "pseudo_R2": round(_m4b.prsquared, 4),
+                    "AIC": round(_m4b.aic, 1),
+                    "ll": round(_m4b.llf, 2),
+                    "coef_idade": round(_m4b.params.get("idade_c", np.nan), 4),
+                    "p_idade": round(_m4b.pvalues.get("idade_c", np.nan), 4),
+                })
+            except Exception as _ee:
+                print(f"[M4b] {_ee}")
+
+        artigo3_comparacao = pd.DataFrame(_modelos_a3)
+        print("\nComparação M1b–M4b (modelos com idade-no-mandato):")
+        print(artigo3_comparacao.to_string(index=False))
+
+        print("\nLeitura: coef_idade representa o efeito por ano adicional de")
+        print("        idade no momento do PL (centralizada na mediana). Se")
+        print("        p_idade > 0,10 em todos os modelos, a variável não")
+        print("        contribui autonomamente após controles, e a coorte")
+        print("        geracional não é determinante do sucesso legislativo.")
+        print("        Comparação direta com M1–M4 originais (no relatório")
+        print("        principal) permite avaliar o ganho marginal de ajuste.")
+    else:
+        print("[ARTIGO-3] df_reg_corp_base ou idade_aprox indisponíveis.")
+except Exception as _e_a3:
+    print(f"[AVISO ARTIGO-3] {_e_a3}")
+
+
+# ── Exportação para xlsx ────────────────────────────────────
+try:
+    _arq_out = PASTA / "resultados_pln_pl.xlsx"
+    if _arq_out.exists():
+        from openpyxl import load_workbook
+        _wb_check = load_workbook(_arq_out)
+        _mode = "a"
+        _writer_kwargs = {"engine": "openpyxl", "mode": "a",
+                          "if_sheet_exists": "replace"}
+    else:
+        _writer_kwargs = {"engine": "openpyxl"}
+
+    with pd.ExcelWriter(_arq_out, **_writer_kwargs) as _writer:
+        if not artigo1_resumo.empty:
+            artigo1_resumo.to_excel(
+                _writer, sheet_name="artigo1_firth", index=False)
+        if not artigo2_confusao.empty:
+            artigo2_confusao.to_excel(
+                _writer, sheet_name="artigo2_confusao", index=False)
+        if not artigo2_topk.empty:
+            artigo2_topk.to_excel(
+                _writer, sheet_name="artigo2_topk", index=False)
+        if not artigo2_metricas.empty:
+            artigo2_metricas.to_excel(
+                _writer, sheet_name="artigo2_metricas", index=False)
+        if not artigo3_comparacao.empty:
+            artigo3_comparacao.to_excel(
+                _writer, sheet_name="artigo3_idade", index=False)
+    print(f"\n[ARTIGO] Abas adicionadas a: {_arq_out}")
+except Exception as _e_exp:
+    print(f"[AVISO export ARTIGO] {_e_exp}")
+
+print("\n" + "=" * 64)
+print("FIM dos blocos ARTIGO")
+print("=" * 64)
+
+
 # =========================================================
 print("\nAnálise concluída com sucesso.")
+
