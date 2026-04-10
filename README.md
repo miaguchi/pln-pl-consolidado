@@ -171,6 +171,13 @@ O pipeline integra metodos de:
 - **Estatistica**: logit com evento raro (King & Zeng, 2001), modelos de contagem (Cameron & Trivedi)
 - **ML**: ensemble methods com validacao temporal (Hastie, Tibshirani & Friedman)
 
+## Versionamento
+
+| Versao | Data | Descricao |
+|---|---|---|
+| v1 (commit inicial) | 2026-03-18 | Pipeline completo: PLN + LDA + logit + ML com backtesting (47 secoes) |
+| v27 | 2026-04-10 | Correcoes para fechamento do artigo: helper Firth filtra colunas da formula; centraliza `ano_c²` apos padronizacao (resolve `p=nan` e pseudo-R² negativo); corrige divisao no Probit (resolve razoes `-9e7`); flag explicito para p-valores `NaN` por separacao quase-completa |
+
 ## Licenca
 
 MIT
